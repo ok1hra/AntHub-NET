@@ -64,7 +64,7 @@ Použití knihovny Wire ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/
 #define ETH_CLK ETH_CLOCK_GPIO17_OUT    // CLKIN pin5 | settings for ESP32 GATEWAY rev f-g
 
 //-------------------------------------------------------------------------------------------------------
-const char* REV = "20230922";
+const char* REV = "20260522";
 char hardware[] = "ANT";
 // const char* HWNAME = "IP-ROT";
 int ANT = 8;
@@ -272,6 +272,16 @@ char mqttTX[MqttBuferSize];
 char mqttPath[MqttBuferSize];
 long MqttStatusTimer[2]{1500,1000};
 // long HeartBeatTimer[2]={0,1000};
+
+// TrxNet
+#include <TrxNet.h>
+WiFiUDP  trxUdp;
+TrxNet   net(trxUdp);
+bool     trxNetEnabled   = false;
+char     trxnetAntId[]   = "01";
+char     trxnetTrx1Name[]= "705.01";
+char     trxnetTrx2Name[]= "OI3.02";
+uint16_t trxnetPort      = 5683;
 
 // https://randomnerdtutorials.com/esp32-i2c-communication-arduino-ide/
 // #include <Wire.h>
@@ -657,6 +667,7 @@ void loop() {
   // MQTT
   httpWall();
   Mqtt();
+  if (trxNetEnabled) net.loop();
   Telnet();
   CLI();
   Watchdog();
@@ -2029,6 +2040,16 @@ void EthEvent(WiFiEvent_t event)
       Serial.println("Mbps");
       eth_connected = true;
 
+      { // TrxNet init / reconnect
+        char trxnetDeviceName[TRXNET_MAX_DEVICE_NAME];
+        snprintf(trxnetDeviceName, sizeof(trxnetDeviceName), "ANT.%s", trxnetAntId);
+        net.setPort(trxnetPort);
+        net.begin(trxnetDeviceName);
+        net.subscribe("/hz", onTrxNetHz);
+        trxNetEnabled = true;
+        Prn(1, String("TrxNet begin ") + trxnetDeviceName);
+      }
+
       #if defined(MQTT)
         if (MQTT_ENABLE == true && MQTT_LOGIN == true){
           // if (mqttClient.connect("esp32gwClient", MQTT_USER, MQTT_PASS)){
@@ -2143,6 +2164,28 @@ bool mqttReconnect() {
     return mqttClient.connected();
 }
 #endif
+
+//------------------------------------------------------------------------------------
+void onTrxNetHz(const char* from, const uint8_t* data, size_t len) {
+  if (len < 4) return;
+  uint32_t freq;
+  memcpy(&freq, data, 4);
+  if (strcmp(from, trxnetTrx1Name) == 0) {
+    TRXfreq[0] = freq;
+    if (EnableSerialDebug > 0) { Prn(0, "TrxNet /hz TRX1 "); Prn(1, String(freq)); }
+    SelectANT(0);
+    #if defined(TFTLCD)
+      bitSet(LcdNeedRefresh, 1);
+    #endif
+  } else if (strcmp(from, trxnetTrx2Name) == 0) {
+    TRXfreq[1] = freq;
+    if (EnableSerialDebug > 0) { Prn(0, "TrxNet /hz TRX2 "); Prn(1, String(freq)); }
+    SelectANT(1);
+    #if defined(TFTLCD)
+      bitSet(LcdNeedRefresh, 2);
+    #endif
+  }
+}
 
 //------------------------------------------------------------------------------------
 void MqttRx(char *topic, byte *payload, unsigned int length) {
