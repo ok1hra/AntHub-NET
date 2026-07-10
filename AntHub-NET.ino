@@ -64,7 +64,7 @@ Použití knihovny Wire ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/
 #define ETH_CLK ETH_CLOCK_GPIO17_OUT    // CLKIN pin5 | settings for ESP32 GATEWAY rev f-g
 
 //-------------------------------------------------------------------------------------------------------
-const char* REV = "20260522";
+const char* REV = "20260707";
 char hardware[] = "ANT";
 // const char* HWNAME = "IP-ROT";
 int ANT = 8;
@@ -282,6 +282,12 @@ char     trxnetAntId[]   = "01";
 char     trxnetTrx1Name[]= "705.01";
 char     trxnetTrx2Name[]= "OI3.02";
 uint16_t trxnetPort      = 5683;
+// Priority name-prefixes: peers whose name begins with one of these are protected
+// from eviction when the peer table (TRXNET_MAX_PEERS) fills — the stalest
+// non-priority peer is dropped instead. Kept in writable buffers so a future
+// config web can overwrite them at runtime. See TrxNet::setPriorityPrefixes().
+char        trxnetPrio[2][8]  = { "OI3", "705" };
+const char* trxnetPrioPtr[2]  = { trxnetPrio[0], trxnetPrio[1] };
 
 // https://randomnerdtutorials.com/esp32-i2c-communication-arduino-ide/
 // #include <Wire.h>
@@ -2045,9 +2051,11 @@ void EthEvent(WiFiEvent_t event)
         snprintf(trxnetDeviceName, sizeof(trxnetDeviceName), "ANT.%s", trxnetAntId);
         net.setPort(trxnetPort);
         net.begin(trxnetDeviceName);
+        net.setPriorityPrefixes(trxnetPrioPtr, sizeof(trxnetPrioPtr) / sizeof(trxnetPrioPtr[0]));
         net.subscribe("/hz", onTrxNetHz);
         trxNetEnabled = true;
-        Prn(1, String("TrxNet begin ") + trxnetDeviceName);
+        Prn(1, String("TrxNet begin ") + trxnetDeviceName
+                + " prio " + trxnetPrio[0] + "," + trxnetPrio[1]);
       }
 
       #if defined(MQTT)
