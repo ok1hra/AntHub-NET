@@ -64,7 +64,7 @@ Použití knihovny Wire ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/
 #define ETH_CLK ETH_CLOCK_GPIO17_OUT    // CLKIN pin5 | settings for ESP32 GATEWAY rev f-g
 
 //-------------------------------------------------------------------------------------------------------
-const char* REV = "20260707";
+const char* REV = "20260710";
 char hardware[] = "ANT";
 // const char* HWNAME = "IP-ROT";
 int ANT = 8;
@@ -84,8 +84,8 @@ Freq Hz from       to          ANT
      {0,   0},  // #7
      {0,   0},  // #8
 
-     {1810000,  7200000},   // #9
-    {10100000,  10150000},  // #10
+     {1810000,  10150000},   // #9
+     {0,   0},  // #10
     {14000000,  14350000},  // #11
     {21000000,  21450000},  // #12
     {28000000,  29700000},  // #13
@@ -288,6 +288,28 @@ uint16_t trxnetPort      = 5683;
 // config web can overwrite them at runtime. See TrxNet::setPriorityPrefixes().
 char        trxnetPrio[2][8]  = { "OI3", "705" };
 const char* trxnetPrioPtr[2]  = { trxnetPrio[0], trxnetPrio[1] };
+
+// --- DIN band-switch for output #9 (multiband vertical) -------------------------
+// When SelectANT() picks output #9 (index 8, "Vertical", 1.81-10.15 MHz) the real
+// antenna sits behind a remote band-switch driven by the DIN device over TrxNet:
+// we command its 8 FREE GPIO via /s-gpio (1 byte) and confirm via its /gpio echo.
+// DIN bit->GPIO map is {0,2,4,12,13,14,32,33}; unused bits stay 0 (DIN is dedicated).
+// Band byte: 160m=0x90, 80m=0x14, 40m=0x00, 30m=0x18 (GPIO33/4/12/13).
+// Pessimistic: hold antenna on #1 (Dummy) until DIN echoes the expected byte, then
+// route #9. Set once per band change; retry only on failure; recover on DIN rejoin.
+char        trxnetDinName[TRXNET_MAX_DEVICE_NAME] = "DIN.01";  // config-overridable
+enum DinState { DIN_IDLE, DIN_PENDING, DIN_CONFIRMED, DIN_FAILED };
+DinState      dinState        = DIN_IDLE;
+int           dinReqTrx       = -1;    // which TRX (0/1) requested #9
+uint8_t       dinExpectedByte = 0;     // band byte we want DIN to apply
+uint8_t       dinConfirmedByte= 0;     // last confirmed byte
+uint8_t       dinLastGpio     = 0;     // last /gpio value received from DIN
+volatile bool dinGpioRx       = false; // set in /gpio callback, drained in DinBandLoop()
+volatile bool dinPeerReappeared = false; // set in onPeerAdded, drained in DinBandLoop()
+uint8_t       dinAttempts     = 0;     // /s-gpio sends in current PENDING sequence
+unsigned long dinSendTimer    = 0;     // millis() of last /s-gpio send (0 = send now)
+const uint8_t DIN_MAX_ATTEMPTS = 3;
+const unsigned long DIN_RETRY_MS = 3000;
 
 // https://randomnerdtutorials.com/esp32-i2c-communication-arduino-ide/
 // #include <Wire.h>
@@ -674,6 +696,7 @@ void loop() {
   httpWall();
   Mqtt();
   if (trxNetEnabled) net.loop();
+  if (trxNetEnabled) DinBandLoop();
   Telnet();
   CLI();
   Watchdog();
@@ -2053,6 +2076,8 @@ void EthEvent(WiFiEvent_t event)
         net.begin(trxnetDeviceName);
         net.setPriorityPrefixes(trxnetPrioPtr, sizeof(trxnetPrioPtr) / sizeof(trxnetPrioPtr[0]));
         net.subscribe("/hz", onTrxNetHz);
+        net.subscribe("/gpio", onTrxNetGpio);      // DIN band-switch echo
+        net.onPeerAdded(onTrxNetPeerAdded);        // re-send /s-gpio on DIN rejoin
         trxNetEnabled = true;
         Prn(1, String("TrxNet begin ") + trxnetDeviceName
                 + " prio " + trxnetPrio[0] + "," + trxnetPrio[1]);
@@ -2192,6 +2217,86 @@ void onTrxNetHz(const char* from, const uint8_t* data, size_t len) {
     #if defined(TFTLCD)
       bitSet(LcdNeedRefresh, 2);
     #endif
+  }
+}
+
+//------------------------------------------------------------------------------------
+// DIN band-switch for output #9 -----------------------------------------------------
+
+// Map freq (Hz) to the DIN /s-gpio band byte for the multiband vertical on output #9.
+// Returns true and sets *out for a supported band; false when freq is inside #9 range
+// (1.81-10.15 MHz) but outside any supported band -> caller treats #9 as unavailable.
+bool DinBandByte(unsigned long f, uint8_t* out) {
+  if (f >= 1810000UL  && f <= 2000000UL)  { *out = 0x90; return true; }  // 160m
+  if (f >= 3500000UL  && f <= 3800000UL)  { *out = 0x14; return true; }  // 80m
+  if (f >= 7000000UL  && f <= 7200000UL)  { *out = 0x00; return true; }  // 40m
+  if (f >= 10100000UL && f <= 10150000UL) { *out = 0x18; return true; }  // 30m
+  return false;
+}
+
+// Forget the DIN band-switch state (leaves DIN relays in their last commanded state).
+void DinReset() {
+  dinState         = DIN_IDLE;
+  dinReqTrx        = -1;
+  dinExpectedByte  = 0;
+  dinConfirmedByte = 0;
+  dinAttempts      = 0;
+  dinSendTimer     = 0;
+}
+
+// /gpio echo from DIN: record it, defer matching to DinBandLoop(). Keep short (runs in net.loop()).
+void onTrxNetGpio(const char* from, const uint8_t* data, size_t len) {
+  if (len < 1) return;
+  if (strcmp(from, trxnetDinName) != 0) return;
+  dinLastGpio = data[0];
+  dinGpioRx   = true;
+}
+
+// DIN (re)joined the peer table: re-arm one send if we still want a band. Keep short.
+void onTrxNetPeerAdded(const TrxPeer* peer) {
+  if (strcmp(peer->name, trxnetDinName) == 0) dinPeerReappeared = true;
+}
+
+// Drives the DIN band-switch state machine from loop() (never from a net.loop() callback).
+void DinBandLoop() {
+  // confirm: expected /gpio echo arrived while waiting -> route antenna to #9
+  if (dinGpioRx) {
+    dinGpioRx = false;
+    if (dinState == DIN_PENDING && dinReqTrx >= 0 && dinLastGpio == dinExpectedByte) {
+      dinState         = DIN_CONFIRMED;
+      dinConfirmedByte = dinExpectedByte;
+      TRXselectANT[dinReqTrx] = 8;
+      ShiftOut();
+      MqttPubString("TRX"+String(dinReqTrx+1)+"ant", String(9), 0);
+      MqttPubString("TRX"+String(dinReqTrx+1)+"antName", ANTname[8], 0);
+      if (EnableSerialDebug > 0) Prn(1, "DIN band confirmed 0x"+String(dinExpectedByte, HEX));
+    }
+  }
+
+  // DIN reappeared: retry a pending/failed band once more
+  if (dinPeerReappeared) {
+    dinPeerReappeared = false;
+    if (dinState == DIN_FAILED || dinState == DIN_PENDING) {
+      dinState     = DIN_PENDING;
+      dinAttempts  = 0;
+      dinSendTimer = 0;   // send now
+    }
+  }
+
+  // pending: send /s-gpio (reliable), retry up to DIN_MAX_ATTEMPTS, then give up on #1
+  if (dinState == DIN_PENDING) {
+    if (dinSendTimer == 0 || millis() - dinSendTimer >= DIN_RETRY_MS) {
+      if (dinAttempts >= DIN_MAX_ATTEMPTS) {
+        dinState = DIN_FAILED;
+        if (EnableSerialDebug > 0) Prn(1, "DIN band FAILED, stay on #1");
+      } else {
+        bool ok = net.publishTo(trxnetDinName, "/s-gpio", &dinExpectedByte, 1, TRX_CON);
+        dinAttempts++;
+        dinSendTimer = millis();
+        if (EnableSerialDebug > 0)
+          Prn(1, "DIN /s-gpio 0x"+String(dinExpectedByte, HEX)+" try "+String(dinAttempts)+(ok?" sent":" (peer unknown)"));
+      }
+    }
   }
 }
 
@@ -2432,6 +2537,34 @@ void SelectANT(int TRX){  // TRX 0 1
       AvailableANTpool[counter][TRX]=0;
       counter++;
     }
+  }
+  // Output #9 (index 8) = multiband vertical behind DIN band-switch.
+  if(TRXselectANT[TRX]==8){
+    uint8_t want;
+    if(!DinBandByte(TRXfreq[TRX], &want)){
+      // inside #9 range but outside a supported band -> antenna unavailable, use #1
+      TRXselectANT[TRX]=0;
+      if(dinReqTrx==TRX) DinReset();
+    }else{
+      bool sameTarget = (dinReqTrx==TRX && dinExpectedByte==want && dinState!=DIN_IDLE);
+      if(dinState==DIN_CONFIRMED && sameTarget){
+        // already confirmed for this band -> keep #9 (leave selection = 8)
+      }else if(sameTarget){
+        // PENDING or FAILED for this exact band -> don't restart, hold on #1
+        TRXselectANT[TRX]=0;
+      }else{
+        // new band (or first request) -> start confirm sequence, hold on #1
+        dinState        = DIN_PENDING;
+        dinReqTrx       = TRX;
+        dinExpectedByte = want;
+        dinAttempts     = 0;
+        dinSendTimer    = 0;          // DinBandLoop() sends immediately
+        TRXselectANT[TRX]=0;
+      }
+    }
+  }else if(dinReqTrx==TRX){
+    // this TRX left #9 -> forget state (DIN keeps its last relay state)
+    DinReset();
   }
   ShiftOut();
   MqttPubString("TRX"+String(TRX+1)+"ant", String(TRXselectANT[TRX]+1), 0);
