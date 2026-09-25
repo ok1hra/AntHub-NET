@@ -22,8 +22,9 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-Send test packet ANT
-  $ mosquitto_pub -h 192.168.1.200 -d -t OK1HRA/OI3/1/hz -m "21060081"
+Web
+  http://<ip>/       antenna switch status + band x output matrix (AntMatrix module)
+  http://<ip>/setup  network, callsign, TrxNet
 Remote USB access
   screen /dev/ttyUSB0 115200
 
@@ -31,6 +32,7 @@ HARDWARE ESP32-POE
 
 Changelog:
 20221029 - initial version
+20260925 - web config (AntMatrix band x output matrix per TRX, NVS), /setup page, MQTT removed
 
 ToDo
 - LCD https://squareline.io/ +
@@ -43,7 +45,6 @@ Použití knihovny Ethernet ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardw
 Použití knihovny ESPmDNS ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/espressif/esp32/libraries/ESPmDNS
 Použití knihovny ArduinoOTA ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/espressif/esp32/libraries/ArduinoOTA
 Použití knihovny Update ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/espressif/esp32/libraries/Update
-Použití knihovny PubSubClient ve verzi 2.8 v adresáři: /home/dan/Arduino/libraries/PubSubClient
 Použití knihovny FS ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/espressif/esp32/libraries/FS
 Použití knihovny SD_MMC ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/espressif/esp32/libraries/SD_MMC
 Použití knihovny SPI ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/espressif/esp32/libraries/SPI
@@ -64,57 +65,22 @@ Použití knihovny Wire ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/
 #define ETH_CLK ETH_CLOCK_GPIO17_OUT    // CLKIN pin5 | settings for ESP32 GATEWAY rev f-g
 
 //-------------------------------------------------------------------------------------------------------
-const char* REV = "20260710";
+const char* REV = "20260925";
 char hardware[] = "ANT";
 // const char* HWNAME = "IP-ROT";
 int ANT = 8;
 unsigned int TRX=1;
 unsigned int TRXselect=0;
-unsigned long TRXfreq[2];
 
 //--- ANT configure ------------------------------
-unsigned long ANTrange[16][2] = {/* TRXfreq[0]
-Freq Hz from       to          ANT
-*/   {1810000,  52000000},  // #1
-     {0,   0},  // #2
-     {0,   0},  // #3
-     {0,   0},  // #4
-     {0,   0},  // #5
-     {0,   0},  // #6
-     {0,   0},  // #7
-     {0,   0},  // #8
-
-     {1810000,  10150000},   // #9
-     {0,   0},  // #10
-    {14000000,  14350000},  // #11
-    {21000000,  21450000},  // #12
-    {28000000,  29700000},  // #13
-    {50000000,  52000000},  // #14
-   {0, 0},  // #15
-   {0, 0},  // #16
-};
-int TRXselectANT[2] = {42,42}; // how antenna selcted - blocked for second TRX - don't be the same!
-int AvailableANTpool[16][2];
-bool TXANT[16] = {1,0,0,0,0,0,0,0, 1,1,1,1,1,1,0,0};  // 1=TX, 0=RX only
-String ANTname[16] = {
-"Dummy",
-"free",
-"free",
-"free",
-"free",
-"free",
-"free",
-"free",
-
-"Vertical",
-"Dipole",
-"Quad",
-"Quad",
-"Quad",
-"Yagi",
-"free",
-"free"
-};
+// Band x output matrix, antenna names and selection logic live in the AntMatrix module
+// (AntMatrix.h/.cpp, web + NVS in AntMatrixEsp.cpp), configured on http://<ip>/
+// First-boot defaults reproduce the former hard-coded table, see AmHostDefaults().
+#include "AntMatrix.h"
+#include "AntMatrixWeb.h"
+#include "SetupPage.h"
+#include <Preferences.h>
+#include <ArduinoJson.h>
 const int ShiftOutDataPin  = 33;
 const int ShiftOutLatchPin = 32;
 const int ShiftOutClockPin = 12;
@@ -152,7 +118,6 @@ dynamicke
 
 
 String YOUR_CALL = "";
-long MeasureTimer[2]={2800000,1800000};
 
 // used by LcdDisplay()
 bool RXonly[16] = {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0};
@@ -189,13 +154,8 @@ int i = 0;
 37-40 - Authorised telnet client IP
 41-140 - Authorised telnet client key
 141-160 - YOUR_CALL
-161-164 - MQTT broker IP
-165-168? - MQTT broker port
-169-201  - QRVbands[16] // 16bit/band for each ant
-202-203  - RXonly[16];  // 1bit (ON/OFF) by ant
-204-220  - Groups[16];     // 1-16
-221-380  - ANTname[16];   // 10 char by ant
-381-509  - Freq2Band[16][2]
+161-168  - free (former MQTT broker IP/port)
+169-509  - free (antenna config moved to NVS "antmx", host settings to NVS "anthub")
 
 !! Increment EEPROM_SIZE #define !!
 
@@ -204,103 +164,60 @@ unsigned int RebootWatchdog;
 unsigned int OutputWatchdog;
 unsigned long WatchdogTimer=0;
 
-WiFiServer server(HTTP_SERVER_PORT);
-bool DHCP_ENABLE = 1;
-char linebuf[80];
-int charcount=0;
-bool connected = false;
+#include <WebServer.h>
+WebServer server(HTTP_SERVER_PORT);
 #include <ETH.h>
 static bool eth_connected = false;
-String HTTP_req;
 #if defined(EnableOTA)
   #include <ESPmDNS.h>
   #include <ArduinoOTA.h>
 #endif
 
-#define MQTT               // Enable MQTT debug
-// #if defined(MQTT)
-//   #include <PubSubClient.h>
-//   // #include "PubSubClient.h" // lokalni verze s upravou #define MQTT_MAX_PACKET_SIZE 128
-//   // WiFiClient esp32Client;
-//   // PubSubClient mqttClient(esp32Client);
-//   WiFiClient espClient;
-//   PubSubClient mqttClient(espClient);
-//   // PubSubClient mqttClient(ethClient);
-//   // PubSubClient mqttClient(server, 1883, callback, ethClient);
-//   long lastMqttReconnectAttempt = 0;
-  bool HeartBeatCfm = true;
-  unsigned long HeartBeatCounter;
-  unsigned long HeartBeatTimer;
-  unsigned long LatencyTimer;
-//   bool MQTT_ENABLE     = 1;          // enable public to MQTT broker
-//   IPAddress mqtt_server_ip(0, 0, 0, 0);
-//   // byte BrokerIpArray[2][4]{
-//   //   // {192,168,1,200},   // MQTT broker remoteqth.com
-//   //   {54,38,157,134},   // MQTT broker remoteqth.com
-//   // };
-//   // IPAddress server(10, 24, 213, 92);    // MQTT broker
-//   int MQTT_PORT;       // MQTT broker PORT
-//   // int MQTT_PORT_Array[2] = {
-//   //   1883,
-//   //   1883
-//   // };       // MQTT broker PORT
-//   boolean MQTT_LOGIN      = 0;          // enable MQTT broker login
-//   // char MQTT_USER= 'login';    // MQTT broker user login
-//   // char MQTT_PASS= 'passwd';   // MQTT broker password
-//   const int MqttBuferSize = 1000; // 1000
-//   char mqttTX[MqttBuferSize];
-//   char mqttPath[MqttBuferSize];
-//   // char mqttTX[100];
-//   // char mqttPath[100];
-//   long MqttStatusTimer[2]{1500,1000};
-//   // long HeartBeatTimer[2]={0,1000};
-// #endif
-
-// MQTT
-#include <PubSubClient.h>  // #include "PubSubClient.h" // lokalni verze s upravou #define MQTT_MAX_PACKET_SIZE 128
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
-long lastMqttReconnectAttempt = 0;
-boolean MQTT_ENABLE     = 1;          // enable public to MQTT broker
-IPAddress mqtt_server_ip(0, 0, 0, 0);
-int MQTT_PORT;       // MQTT broker PORT
-boolean MQTT_LOGIN      = 0;          // enable MQTT broker login
-// char MQTT_USER= 'login';    // MQTT broker user login
-// char MQTT_PASS= 'passwd';   // MQTT broker password
-const int MqttBuferSize = 1000; // 1000
-char mqttTX[MqttBuferSize];
-char mqttPath[MqttBuferSize];
-long MqttStatusTimer[2]{1500,1000};
-// long HeartBeatTimer[2]={0,1000};
+// Host settings, NVS namespace "anthub", edited on /setup, applied after reboot
+#define HOST_NVS_NS "anthub"
+bool      DHCP_ENABLE = 1;
+IPAddress StaticIp(192, 168, 1, 188);
+IPAddress StaticMask(255, 255, 255, 0);
+IPAddress StaticGw(192, 168, 1, 1);
+IPAddress StaticDns(8, 8, 8, 8);
 
 // TrxNet
 #include <TrxNet.h>
 WiFiUDP  trxUdp;
 TrxNet   net(trxUdp);
 bool     trxNetEnabled   = false;
-char     trxnetAntId[]   = "01";
-char     trxnetTrx1Name[]= "705.01";
-char     trxnetTrx2Name[]= "OI3.02";
+char     trxnetAntId[8]  = "01";
+char     trxnetTrx1Name[TRXNET_MAX_DEVICE_NAME] = "705.01";  // /hz source for TRX1, picked on /setup
+char     trxnetTrx2Name[TRXNET_MAX_DEVICE_NAME] = "OI3.02";  // /hz source for TRX2, picked on /setup
 uint16_t trxnetPort      = 5683;
+// Last /hz per sender, shown in the /setup device list (filled in onTrxNetHz)
+#define HZ_SRC_MAX 8
+struct HzSrc {
+  char     name[TRXNET_MAX_DEVICE_NAME];
+  uint32_t hz;
+  uint32_t ms;     // millis() of last /hz, 0 = empty slot
+};
+HzSrc hzSrc[HZ_SRC_MAX];
 // Priority name-prefixes: peers whose name begins with one of these are protected
 // from eviction when the peer table (TRXNET_MAX_PEERS) fills — the stalest
-// non-priority peer is dropped instead. Kept in writable buffers so a future
-// config web can overwrite them at runtime. See TrxNet::setPriorityPrefixes().
+// non-priority peer is dropped instead. Configured on /setup (NVS), see
+// TrxNet::setPriorityPrefixes().
 char        trxnetPrio[2][8]  = { "OI3", "705" };
 const char* trxnetPrioPtr[2]  = { trxnetPrio[0], trxnetPrio[1] };
 
-// --- DIN band-switch for output #9 (multiband vertical) -------------------------
-// When SelectANT() picks output #9 (index 8, "Vertical", 1.81-10.15 MHz) the real
-// antenna sits behind a remote band-switch driven by the DIN device over TrxNet:
-// we command its 8 FREE GPIO via /s-gpio (1 byte) and confirm via its /gpio echo.
+// --- DIN band-switch = AntMatrix external confirmation -------------------------
+// Outputs with "Ext confirm" (default #9, multiband vertical) sit behind a remote
+// band-switch driven by the DIN device over TrxNet. AntMatrix calls AmExtRequest()
+// with the band row ext code; we command DIN's 8 FREE GPIO via /s-gpio (1 byte) and
+// confirm via its /gpio echo, then report amExtResult(). Meanwhile AntMatrix keeps the
+// output's fallback (default #1 Dummy) active.
 // DIN bit->GPIO map is {0,2,4,12,13,14,32,33}; unused bits stay 0 (DIN is dedicated).
-// Band byte: 160m=0x90, 80m=0x14, 40m=0x00, 30m=0x18 (GPIO33/4/12/13).
-// Pessimistic: hold antenna on #1 (Dummy) until DIN echoes the expected byte, then
-// route #9. Set once per band change; retry only on failure; recover on DIN rejoin.
-char        trxnetDinName[TRXNET_MAX_DEVICE_NAME] = "DIN.01";  // config-overridable
+// Default codes: 160m=0x90, 80m=0x14, 40m=0x00, 30m=0x18 (GPIO33/4/12/13).
+// Set once per band change; retry only on failure; recover on DIN rejoin.
+char        trxnetDinName[TRXNET_MAX_DEVICE_NAME] = "DIN.01";  // configured on /setup
 enum DinState { DIN_IDLE, DIN_PENDING, DIN_CONFIRMED, DIN_FAILED };
 DinState      dinState        = DIN_IDLE;
-int           dinReqTrx       = -1;    // which TRX (0/1) requested #9
+int           dinReqTrx       = -1;    // which TRX requested the ext output
 uint8_t       dinExpectedByte = 0;     // band byte we want DIN to apply
 uint8_t       dinConfirmedByte= 0;     // last confirmed byte
 uint8_t       dinLastGpio     = 0;     // last /gpio value received from DIN
@@ -310,6 +227,18 @@ uint8_t       dinAttempts     = 0;     // /s-gpio sends in current PENDING seque
 unsigned long dinSendTimer    = 0;     // millis() of last /s-gpio send (0 = send now)
 const uint8_t DIN_MAX_ATTEMPTS = 3;
 const unsigned long DIN_RETRY_MS = 3000;
+
+// Host settings as stored on /setup (see HostRead/HostSave)
+struct HostCfg {
+  bool      dhcp;
+  IPAddress ip, mask, gw, dns;
+  uint16_t  port;
+  char      antId[sizeof(trxnetAntId)];
+  char      trx1[TRXNET_MAX_DEVICE_NAME];
+  char      trx2[TRXNET_MAX_DEVICE_NAME];
+  char      din[TRXNET_MAX_DEVICE_NAME];
+  char      prio[2][sizeof(trxnetPrio[0])];
+};
 
 // https://randomnerdtutorials.com/esp32-i2c-communication-arduino-ide/
 // #include <Wire.h>
@@ -520,24 +449,7 @@ void setup() {
   }
 
 
-  #if defined(MQTT)
-    // MQTT broker IP
-    for(int i=0; i<4; i++){
-      mqtt_server_ip[i]=EEPROM.readByte(i+161);
-    }
-    MQTT_PORT = EEPROM.readInt(165);
-    if(mqtt_server_ip[0]==255 && mqtt_server_ip[1]==255 && mqtt_server_ip[2]==255 && mqtt_server_ip[3]==255 && MQTT_PORT==-1){
-      mqtt_server_ip[0]=192;
-      mqtt_server_ip[1]=168;
-      mqtt_server_ip[2]=1;
-      mqtt_server_ip[3]=200;
-      // mqtt_server_ip[0]=54;
-      // mqtt_server_ip[1]=38;
-      // mqtt_server_ip[2]=157;
-      // mqtt_server_ip[3]=134;
-      MQTT_PORT=1883;
-    }
-  #endif
+  HostLoad();
 
   Serial.println("===============================");
   Serial.println("  press '?' for list commands");
@@ -551,10 +463,9 @@ void setup() {
     // ETH.begin();
     ETH.begin(ETH_ADDR, ETH_POWER, ETH_MDC, ETH_MDIO, ETH_TYPE, ETH_CLK);
     if(DHCP_ENABLE==false){
-      ETH.config(IPAddress(192, 168, 1, 188), IPAddress(192, 168, 1, 255),IPAddress(255, 255, 255, 0),IPAddress(8, 8, 8, 8));
+      ETH.config(StaticIp, StaticGw, StaticMask, StaticDns);
       //config(IPAddress local_ip, IPAddress gateway, IPAddress subnet, IPAddress dns1 = (uint32_t)0x00000000, IPAddress dns2 = (uint32_t)0x00000000);
     }
-    server.begin();
     // chipid=ESP.getEfuseMac();//The chip ID is essentially its MAC address(length: 6 bytes).
     //   unsigned long long1 = (unsigned long)((chipid & 0xFFFF0000) >> 16 );
     //   unsigned long long2 = (unsigned long)((chipid & 0x0000FFFF));
@@ -686,15 +597,41 @@ void setup() {
    shiftOut(ShiftOutDataPin, ShiftOutClockPin, LSBFIRST, B00000000);
    shiftOut(ShiftOutDataPin, ShiftOutClockPin, LSBFIRST, B00000000);
    digitalWrite(ShiftOutLatchPin, HIGH);
+
+   // AntMatrix antenna switch + web
+   AmHooks amHooks = {};
+   amHooks.writeOutputs = AmWriteOutputs;
+   amHooks.extRequest   = AmExtRequest;
+   amHooks.extCancel    = AmExtCancel;
+   amHooks.changed      = AmChanged;
+   amHooks.millis       = AmMillis;
+   amHooks.defaults     = AmHostDefaults;
+   amInit(amHooks);
+   AmConfig amCfg;
+   if(!amStoreLoad(amCfg)){
+     amLoadDefaults(amCfg);
+     Serial.println("AntMatrix: no stored config, using defaults");
+   }
+   amApplyConfig(amCfg);
+   TrxEnabledLoad();
+   amWebBegin(server, "<a class=\"tab\" href=\"/setup\">SETUP</a>");
+   server.on("/setup",      HTTP_GET,  HttpSetupPage);
+   server.on("/api/setup",  HTTP_GET,  HttpSetupGet);
+   server.on("/api/setup",  HTTP_POST, HttpSetupPost);
+   server.on("/api/reboot", HTTP_POST, HttpReboot);
+   server.on("/api/peers",  HTTP_GET,  HttpPeersGet);
+   server.on("/api/trxsrc", HTTP_POST, HttpTrxSource);
+   server.on("/api/trxen",  HTTP_POST, HttpTrxEnable);
+   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+   server.begin();
+
    EnableSerialDebug = 0;
 }
 
 //-------------------------------------------------------------------------------------------------------
 
 void loop() {
-  // MQTT
-  httpWall();
-  Mqtt();
+  server.handleClient();
   if (trxNetEnabled) net.loop();
   if (trxNetEnabled) DinBandLoop();
   Telnet();
@@ -726,119 +663,14 @@ void Lcd() { // 320x240 px
   if(LcdNeedRefresh > B00000000){
     // freq1
     if(bitRead(LcdNeedRefresh, 1)==1){
-      tft.fillRect(0, 0, 320, 18, ILI9341_BLACK);
-      // tft.setTextColor(ConvertRGB(51,153,255));
-      if(TRXfreq[0]==0){
-        tft.setTextColor(ILI9341_DARKGREY);
-      }else{
-        tft.setTextColor(ConvertRGB(102,178,255));
-      }
-      tft.setCursor(6,2);
-      tft.setTextSize(2);
-
-      int MHZ = TRXfreq[0]/1000000;
-      if(MHZ<100 && MHZ>9){
-        tft.print(" ");
-      }else if(MHZ<10){
-        tft.print("  ");
-      }
-      tft.print(MHZ);
-      tft.print(".");
-      int KHZ = TRXfreq[0]/1000-(MHZ*1000);
-      if(KHZ<100 && KHZ>9){
-        tft.print("0");
-      }else if(KHZ<10){
-        tft.print("00");
-      }
-      tft.print(KHZ);
-      tft.print(" kHz ");
-      tft.setTextColor(ILI9341_LIGHTGREY);
-      if(TRXselectANT[0]<16){
-        if(TRXselectANT[0]+1<10){
-          tft.print(" ");
-        }
-        tft.print(TRXselectANT[0]+1);
-        tft.print("-"+ANTname[TRXselectANT[0]]);
-      }else{
-        tft.print("off");
-      }
-
-      // POOL
-      tft.fillRect(0, 19, 320, 18, ILI9341_BLACK);
-      tft.setCursor(6,21);
-      tft.setTextSize(2);
-      for (int counter=0; counter<16; counter++) {
-        if(AvailableANTpool[counter][0]!=0){
-          if(TXANT[AvailableANTpool[counter][0]-1]==1){
-            tft.setTextColor(ConvertRGB(150,0,0));
-          }else{
-            tft.setTextColor(ILI9341_DARKGREEN);
-          }
-          tft.print(AvailableANTpool[counter][0]);
-          tft.print("-"+ANTname[AvailableANTpool[counter][0]-1]+" ");
-        }
-      }
-
-      // bitSet(LcdNeedRefresh, 7);
+      LcdTrx(0, 0);
       bitClear(LcdNeedRefresh, 1);
     }
-
 
     // freq2
     if(bitRead(LcdNeedRefresh, 2)==1){
       tft.drawLine(0,107,340,107, ILI9341_DARKGREY);
-      tft.fillRect(0, 110, 320, 18, ILI9341_BLACK);
-      if(TRXfreq[1]==0){
-        tft.setTextColor(ILI9341_DARKGREY);
-      }else{
-        tft.setTextColor(ConvertRGB(102,178,255));
-      }
-      tft.setCursor(6,112);
-      tft.setTextSize(2);
-
-      int MHZ = TRXfreq[1]/1000000;
-      if(MHZ<100 && MHZ>9){
-        tft.print(" ");
-      }else if(MHZ<10){
-        tft.print("  ");
-      }
-      tft.print(MHZ);
-      tft.print(".");
-      int KHZ = TRXfreq[1]/1000-(MHZ*1000);
-      if(KHZ<100 && KHZ>9){
-        tft.print("0");
-      }else if(KHZ<10){
-        tft.print("00");
-      }
-      tft.print(KHZ);
-      tft.print(" kHz ");
-      tft.setTextColor(ILI9341_LIGHTGREY);
-      if(TRXselectANT[1]<16){
-        if(TRXselectANT[0]+1<10){
-          tft.print(" ");
-        }
-        tft.print(TRXselectANT[1]+1);
-        tft.print("-"+ANTname[TRXselectANT[1]]);
-      }else{
-        tft.print("off");
-      }
-
-      // POOL
-      tft.fillRect(0, 129, 320, 18, ILI9341_BLACK);
-      tft.setCursor(6,131);
-      tft.setTextSize(2);
-      for (int counter=0; counter<16; counter++) {
-        if(AvailableANTpool[counter][1]!=0){
-          if(TXANT[AvailableANTpool[counter][0]-1]==0){
-            tft.setTextColor(ConvertRGB(150,0,0));
-          }else{
-            tft.setTextColor(ILI9341_DARKGREEN);
-          }
-          tft.print(AvailableANTpool[counter][1]);
-          tft.print("-"+ANTname[AvailableANTpool[counter][1]-1]+" ");
-        }
-      }
-
+      LcdTrx(1, 110);
       bitClear(LcdNeedRefresh, 2);
     }
 
@@ -855,20 +687,6 @@ void Lcd() { // 320x240 px
         tft.print("ETH-OFF ");
       }
 
-      char charbuf[50];
-      ETH.macAddress().toCharArray(charbuf, 18);
-      // charbuf[6] = 0;
-      #if defined(MQTT)
-        if(mqttClient.connected()==true){
-          if (mqttClient.connect(charbuf)) {
-            tft.print("mqtt ");
-            // tft.setTextColor(ILI9341_WHITE);
-          }else{
-            tft.print("mqtt-OFF ");
-          //   tft.setTextColor(ILI9341_LIGHTGREY);
-          }
-        }
-      #endif
       tft.setCursor(235,240-12+3);
       tft.print("ip"+String(hardware)+" ");
       tft.setCursor(270,240-12+3);
@@ -880,6 +698,81 @@ void Lcd() { // 320x240 px
   }
   #endif
 }
+
+#if defined(TFTLCD)
+// One TRX block: frequency + active antenna, second line antenna pool
+// pool colors: green = active, orange = waiting for ext confirmation, red = held by other TRX
+void LcdTrx(int trx, int y){
+  const AmTrx& s = amTrx(trx);
+  const AmConfig& c = amConfig();
+  tft.fillRect(0, y, 320, 18, ILI9341_BLACK);
+  if(s.hz==0){
+    tft.setTextColor(ILI9341_DARKGREY);
+  }else{
+    tft.setTextColor(ConvertRGB(102,178,255));
+  }
+  tft.setCursor(6,y+2);
+  tft.setTextSize(2);
+
+  int MHZ = s.hz/1000000;
+  if(MHZ<100 && MHZ>9){
+    tft.print(" ");
+  }else if(MHZ<10){
+    tft.print("  ");
+  }
+  tft.print(MHZ);
+  tft.print(".");
+  int KHZ = s.hz/1000-(MHZ*1000);
+  if(KHZ<100 && KHZ>9){
+    tft.print("0");
+  }else if(KHZ<10){
+    tft.print("00");
+  }
+  tft.print(KHZ);
+  tft.print(" kHz ");
+  tft.setTextColor(ILI9341_LIGHTGREY);
+  if(s.active>=0){
+    if(s.active+1<10){
+      tft.print(" ");
+    }
+    tft.print(s.active+1);
+    tft.print("-");
+    tft.print(c.out[s.active].name);
+    if(s.want>=0 && s.want!=s.active){
+      tft.print("*");  // waiting for ext confirmation
+    }
+  }else if(s.disabled){
+    tft.print("disabled");
+  }else if(s.starved){
+    tft.setTextColor(ILI9341_RED);
+    tft.print("busy");
+  }else{
+    tft.print("off");
+  }
+
+  // POOL
+  tft.fillRect(0, y+19, 320, 18, ILI9341_BLACK);
+  tft.setCursor(6,y+21);
+  tft.setTextSize(2);
+  uint16_t taken = amTakenByOthers(trx);
+  for(int o=0; o<AM_OUT; o++){
+    if(!bitRead(s.pool, o)) continue;
+    if(o==s.active){
+      tft.setTextColor(ILI9341_GREEN);
+    }else if(o==s.want){
+      tft.setTextColor(ILI9341_ORANGE);
+    }else if(bitRead(taken, o)){
+      tft.setTextColor(ConvertRGB(150,0,0));
+    }else{
+      tft.setTextColor(ILI9341_DARKGREY);
+    }
+    tft.print(o+1);
+    tft.print("-");
+    tft.print(c.out[o].name);
+    tft.print(" ");
+  }
+}
+#endif
 //-------------------------------------------------------------------------------------------------------
 void LcdDisplay(int YheaderSize, int Xbutons, int YfooterSize) { // 320x240 px
   #if defined(TFTLCD)
@@ -1068,7 +961,7 @@ BD send frequency to AntSw
                     PageShift = 8;
                   }
                   // fill button
-                if(ANTname[i+j*Xbutons+PageShift]=="n/a"){
+                if(strcmp(amConfig().out[i+j*Xbutons+PageShift].name, "n/a")==0){
                   // nil
                 }else{
                   // QRVbands[16];  // 16bit/band for each ant
@@ -1082,7 +975,7 @@ BD send frequency to AntSw
                   tft.setTextSize(1);
                   tft.setCursor(XSize*i+Frame*3, YheaderSize+YSize*j+2.5*Frame);
                   // name
-                  tft.print(ANTname[i+j*Xbutons+PageShift]);
+                  tft.print(amConfig().out[i+j*Xbutons+PageShift].name);
                   if(Ybutons==3){
                     // group
                     tft.setTextSize(1);
@@ -1105,15 +998,9 @@ BD send frequency to AntSw
             tft.setCursor(80, 22);
             tft.print("CALLSIGN "+YOUR_CALL );
             tft.setCursor(80, 22+12);
-            #if defined(MQTT)
-              tft.print("MQTT broker "+String(mqtt_server_ip[0])+"."+String(mqtt_server_ip[1])+"."+String(mqtt_server_ip[2])+"."+String(mqtt_server_ip[3])+":"+String(MQTT_PORT));
-            #endif
             tft.setCursor(80, 22+2*12);
             tft.print("ANT "+String(ANT)+" | TRX "+String(TRX)+" | LCD rotation "+String(TftRotation));
             tft.setCursor(80, 22+3*12);
-            #if defined(MQTT)
-              tft.print("Latency "+String(LatencyTimer/2)+"ms (half path)" );
-            #endif
             break;
           }
       }
@@ -1217,16 +1104,6 @@ BD send frequency to AntSw
       char charbuf[50];
       ETH.macAddress().toCharArray(charbuf, 18);
       // charbuf[6] = 0;
-      #if defined(MQTT)
-        if(mqttClient.connected()==true){
-          if (mqttClient.connect(charbuf)) {
-            tft.print("mqtt ");
-            // tft.setTextColor(ILI9341_WHITE);
-          // }else{
-          //   tft.setTextColor(ILI9341_LIGHTGREY);
-          }
-        }
-      #endif
       tft.setCursor(200,240-YfooterSize+3);
       tft.print("TRX-"+String(TRXselect+1)+" ");
       tft.setTextColor(ILI9341_LIGHTGREY);
@@ -1271,21 +1148,6 @@ void Watchdog(){
   if(!TelnetServerClients[0].connected() && FirstListCommands==false){
     FirstListCommands=true;
   }
-
-  #if defined(MQTT)
-    if( (HeartBeatCfm==true && millis()-HeartBeatTimer > 2000) || (millis()-HeartBeatTimer > 20000) ){
-        MqttPubString("HeartBeat", String(HeartBeatCounter), 0);
-      HeartBeatTimer=millis();
-      if(EnableSerialDebug>1){
-        Prn(1, String("TX HeartBeat"));
-      }
-      HeartBeatCfm=false;
-      HeartBeatCounter++;
-    }
-  #endif
-
-
-
 }
 //-------------------------------------------------------------------------------------------------------
 
@@ -1335,16 +1197,6 @@ void ListCommands(int OUT){
     Prn(1," minutes");
   }
 
-  #if defined(MQTT)
-    Prn(0,"  MqttSubscribe: "+String(mqtt_server_ip[0])+"."+String(mqtt_server_ip[1])+"."+String(mqtt_server_ip[2])+"."+String(mqtt_server_ip[3])+":"+String(MQTT_PORT)+"/");
-    String topic = String(YOUR_CALL) + "/OI3/0/hz";
-    const char *cstr = topic.c_str();
-    if(mqttClient.subscribe(cstr)==true){
-      Prn(1, String(cstr));
-    }else{
-      Prn(1, "FALSE");
-    }
-  #endif
 
   Prn(0,"  Firmware: ");
   Prn(1, String(REV));
@@ -1352,7 +1204,12 @@ void ListCommands(int OUT){
   Prn(1, String(hardware));
   Prn(0, "  ShiftOut GPIO [data, latch, clock]: ");
   Prn(1, String(ShiftOutDataPin)+", "+String(ShiftOutLatchPin)+", "+String(ShiftOutClockPin));
-  Prn(1, "  TRX1 "+String(TRXselectANT[0]+1)+" | TRX2 "+String(TRXselectANT[1]+1));
+  for(int t=0; t<AM_TRX; t++){
+    const AmTrx& s = amTrx(t);
+    String ant = s.active>=0 ? String(s.active+1)+"-"+amConfig().out[s.active].name : String(s.disabled ? "disabled" : s.starved ? "busy" : "off");
+    if(s.want>=0 && s.want!=s.active) ant += " (want "+String(s.want+1)+", ext "+amExtName(s.ext)+")";
+    Prn(1, "  TRX"+String(t+1)+" "+String(s.hz)+" Hz | ANT "+ant);
+  }
   Prn(0, "  Bank status ABCD [LSBFIRST]: ");
   Prn(0, String(ShiftOutByte[0], BIN) );
   Prn(0, " ");
@@ -1366,9 +1223,6 @@ void ListCommands(int OUT){
   Prn(1,"      ?  list status and commands");
   #if defined(TFTLCD)
   Prn(1,"      r  LCD rotation ["+String(TftRotation)+"]");
-  #endif
-  #if defined(MQTT)
-    Prn(1,"      +  change MQTT broker IP | "+String(mqtt_server_ip[0])+"."+String(mqtt_server_ip[1])+"."+String(mqtt_server_ip[2])+"."+String(mqtt_server_ip[3])+":"+String(MQTT_PORT));
   #endif
   Prn(1,"      L  change CALLSIGN ["+YOUR_CALL+"]");
   Prn(1,"");
@@ -1460,45 +1314,6 @@ void CLI(){
         Prn(1,"Rotation set to "+String(TftRotation));
       #endif
 
-    #if defined(MQTT)
-    // +
-    }else if(incomingByte==43){
-      Prn(1,"  enter MQTT broker IP address by four number (0-255) and press [enter] after each");
-      Prn(1,"  NOTE: public remoteqth broker 54.38.157.134:1883");
-      for (int i=0; i<5; i++){
-        if(i==4){
-          Prn(0,"enter IP port (1-65535) and press [");
-        }
-        if(TelnetAuthorized==true){
-          Prn(1,"enter]");
-        }else{
-          Prn(1,";]");
-        }
-        Enter();
-        int intBuf=0;
-        int mult=1;
-        for (int j=InputByte[0]; j>0; j--){  // [0] is counter
-          intBuf = intBuf + ((InputByte[j]-48)*mult);
-          mult = mult*10;
-        }
-        if( (i<4 && intBuf>=0 && intBuf<=255) || (i==4 && intBuf>=1 && intBuf<=65535) ){
-          if(i==4){
-            EEPROM.writeInt(165, intBuf);
-          }else{
-            EEPROM.writeByte(161+i, intBuf);
-          }
-          // Prn(1,"EEPROMcomit");
-          EEPROM.commit();
-        }else{
-          Prn(1,"Out of range.");
-          break;
-        }
-      }
-      Prn(0,"** device will be restarted **");
-      delay(1000);
-      TelnetServerClients[0].stop();
-      ESP.restart();
-    #endif
 
     // L
     }else if(incomingByte==76){
@@ -1832,212 +1647,6 @@ void Prn(int LN, String STR){
 }
 //-------------------------------------------------------------------------------------------------------
 
-void httpWall(){
-  #if defined(MQTT)
-  // listen for incoming clients
-  WiFiClient webClient = server.available();
-  if (webClient) {
-    if(EnableSerialDebug>0){
-      Serial.println("WIFI New webClient");
-    }
-    memset(linebuf,0,sizeof(linebuf));
-    charcount=0;
-    // an http request ends with a blank line
-    boolean currentLineIsBlank = true;
-    while (webClient.connected()) {
-      if (webClient.available()) {
-        char c = webClient.read();
-        HTTP_req += c;
-        // if(EnableSerialDebug>0){
-        //   Serial.write(c);
-        // }
-        //read char by char HTTP request
-        linebuf[charcount]=c;
-        if (charcount<sizeof(linebuf)-1) charcount++;
-        // if you've gotten to the end of the line (received a newline
-        // character) and the line is blank, the http request has ended,
-        // so you can send a reply
-        if (c == '\n' && currentLineIsBlank) {
-          // send a standard http response header
-
-          // send a standard http response header
-          webClient.println(F("HTTP/1.1 200 OK"));
-          webClient.println(F("Content-Type: text/html"));
-          webClient.println(F("Connection: close"));  // the connection will be closed after completion of the response
-          webClient.println();
-          webClient.println(F("  <!DOCTYPE html>"));
-          webClient.println(F("  <html>"));
-          webClient.println(F("      <head>"));
-          webClient.println(F("          <meta http-equiv=\"Content-Type\" content=\"text/html;charset=utf-8\"/>"));
-          webClient.println(F("          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"));
-          // webClient.println(F("          <meta http-equiv=\"refresh\" content=\"10\">"));
-          webClient.println(F("          <link rel=\"stylesheet\" type=\"text/css\" href=\"https://remoteqth.com/mqtt-wall/style.css\">"));
-          // TITLE
-          webClient.print(F("           <title>"));
-          webClient.print(hardware);
-          webClient.print(F(" station "));
-          webClient.print(YOUR_CALL);
-          webClient.println(F("</title>"));
-          // END TITLE
-          webClient.println(F("          <link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"style/apple-touch-icon.png\">"));
-          webClient.println(F("          <link rel=\"mask-icon\" href=\"style/safari-pinned-tab.svg\" color=\"#5bbad5\">"));
-          webClient.println(F("          <link rel=\"icon\" type=\"image/png\" href=\"style/favicon-32x32.png\" sizes=\"32x32\">"));
-          webClient.println(F("          <link rel=\"icon\" type=\"image/png\" href=\"style/favicon-16x16.png\" sizes=\"16x16\">"));
-          webClient.println(F("          <link rel=\"manifest\" href=\"style/manifest.json\">"));
-          webClient.println(F("          <link rel=\"shortcut icon\" href=\"style/favicon.ico\">"));
-          webClient.println(F("          <meta name='apple-mobile-web-app-capable' content='yes'>"));
-          webClient.println(F("          <meta name='mobile-web-app-capable' content='yes'>"));
-          webClient.println(F("          <meta name=\"msapplication-config\" content=\"style/browserconfig.xml\">"));
-          webClient.println(F("          <meta name=\"theme-color\" content=\"#ffffff\">"));
-          webClient.println(F("          <script type=\"text/javascript\">"));
-          webClient.println(F("          var config = {"));
-          webClient.println(F("              server: {"));
-          webClient.print(F("                  uri: \"ws://"));
-          webClient.print(mqtt_server_ip[0]);
-          webClient.print(F("."));
-          webClient.print(mqtt_server_ip[1]);
-          webClient.print(F("."));
-          webClient.print(mqtt_server_ip[2]);
-          webClient.print(F("."));
-          webClient.print(mqtt_server_ip[3]);
-          webClient.println(":1884/\",");
-          webClient.println(F("              },"));
-          // TOPIC
-          webClient.print(F("              defaultTopic: \""));
-          webClient.print(YOUR_CALL);
-          webClient.print(F("/"));
-          webClient.print(hardware);
-          webClient.println(F("/#\","));
-          // END TOPIC
-          webClient.println(F("              showCounter: true,"));
-          webClient.println(F("              alphabeticalSort: true,"));
-          webClient.println(F("              qos: 0"));
-          webClient.println(F("          };"));
-          webClient.println(F("          </script>"));
-          // END TOPIC
-          webClient.println(F("      </head>"));
-          webClient.println(F("      <body>"));
-          webClient.print(F("          <div id=\"frame\" "));
-          webClient.println(F(">"));
-          webClient.println(F("              <div id=\"footer\">"));
-          webClient.println(F("                  <p class=\"status\" style=\"font-size: 150%;\">"));
-          // STATUS
-          webClient.print(F("Uptime: "));
-          if(millis() < 60000){
-            webClient.print(millis()/1000);
-            webClient.print(F(" seconds"));
-          }else if(millis() > 60000 && millis() < 3600000){
-            webClient.print(millis()/60000);
-            webClient.print(F(" minutes"));
-          }else if(millis() > 3600000 && millis() < 86400000){
-            webClient.print(millis()/3600000);
-            webClient.print(F(" hours"));
-          }else{
-            webClient.print(millis()/86400000);
-            webClient.print(F(" days"));
-          }
-          webClient.print(F(" | version: "));
-          webClient.println(REV);
-          webClient.print(F(" | eth mac: "));
-          for (int i = 0; i < 6; i++) {
-            webClient.print(ETH.macAddress()[i], HEX);
-            webClient.print(F(":"));
-          }
-          webClient.println();
-
-          webClient.print(F(" | dhcp: "));
-          if(DHCP_ENABLE==1){
-            webClient.print(F("ON"));
-          }else{
-            webClient.print(F("OFF"));
-          }
-          webClient.print(F(" | ip: "));
-          webClient.println(ETH.localIP());
-          // webClient.print(F(" | utc from ntp: "));
-          // webClient.println(F("timeClient.getFormattedTime()"));
-          // webClient.println(F("<br>MQTT subscribe command: $ mosquitto_sub -v -h mqttstage.prusa -t prusa-debug/prusafil/extrusionline/+/#"));
-          webClient.print(F(" | Broker ip: "));
-          webClient.print(mqtt_server_ip[0]);
-          webClient.print(F("."));
-          webClient.print(mqtt_server_ip[1]);
-          webClient.print(F("."));
-          webClient.print(mqtt_server_ip[2]);
-          webClient.print(F("."));
-          webClient.print(mqtt_server_ip[3]);
-          webClient.print(F(":"));
-          webClient.print(MQTT_PORT);
-          // webClient.print(F(" | Refresh time "));
-          // webClient.print(MeasureTimer[1]/60000);
-          // webClient.println(F(" min"));
-          // if(AprsON==true){
-          //   webClient.print(F(" | <a href=\"https://aprs.fi/#!call="));
-          //   webClient.print(YOUR_CALL);
-          //   webClient.println(F("\" target=_blank>APRS</a>"));
-          // }
-          // END STATUS
-          webClient.println(F("              </p>"));
-          webClient.println(F("              </div>"));
-          webClient.println(F("              <div id=\"header\">"));
-          webClient.println(F("                  <div id=\"topic-box\">"));
-          webClient.println(F("                      <input type=\"text\" id=\"topic\" value=\"\" title=\"Topic to subscribe\">"));
-          webClient.println(F("                  </div>"));
-          webClient.println(F("              </div>"));
-          webClient.println(F("              <div id=\"toast\"></div>"));
-          webClient.println(F("              <section class=\"messages\"></section>"));
-          webClient.println(F("              <div id=\"footer\">"));
-          webClient.println(F("                  <p class=\"status\">"));
-          webClient.println(F("                      Client <code id=\"status-client\" title=\"Client ID\">?</code> is "));
-          webClient.println(F("                      <code id=\"status-state\" class=\"connecting\"><em>&bull;</em> <span>connecting...</span></code> to "));
-          webClient.println(F("                      <code id=\"status-host\">?</code>"));
-          webClient.println(F("                      <em>via</em> MQTT Wall 0.3.0 (<a href=\"https://github.com/bastlirna/mqtt-wall\">github</a>)"));
-          // webClient.println(F("                      | <a href=\"https://remoteqth.com/wiki/\" target=\"_blank\">WX Wiki</a>."));
-          webClient.println(F("                  </p>"));
-          webClient.println(F("              </div>"));
-          webClient.println(F("          </div>"));
-          webClient.println(F("          <script type=\"text/javascript\" src=\"https://code.jquery.com/jquery-2.1.4.min.js\"></script>"));
-          webClient.println(F("          <script type=\"text/javascript\" src=\"https://code.jquery.com/color/jquery.color-2.1.2.min.js\"></script>"));
-          webClient.println(F("          <script type=\"text/javascript\" src=\"https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js\"></script>"));
-          webClient.println(F("          <script type=\"text/javascript\" src=\"https://remoteqth.com/mqtt-wall/wall.js\"></script>"));
-          webClient.println(F("      </body>"));
-          webClient.println(F("  </html>"));
-
-          if(EnableSerialDebug>0){
-            Serial.print(HTTP_req);
-          }
-          HTTP_req = "";
-
-          break;
-        }
-        if (c == '\n') {
-          // you're starting a new line
-          currentLineIsBlank = true;
-          // if (strstr(linebuf,"GET /h0 ") > 0){digitalWrite(GPIOS[0], HIGH);}else if (strstr(linebuf,"GET /l0 ") > 0){digitalWrite(GPIOS[0], LOW);}
-          // else if (strstr(linebuf,"GET /h1 ") > 0){digitalWrite(GPIOS[1], HIGH);}else if (strstr(linebuf,"GET /l1 ") > 0){digitalWrite(GPIOS[1], LOW);}
-
-          // you're starting a new line
-          currentLineIsBlank = true;
-          memset(linebuf,0,sizeof(linebuf));
-          charcount=0;
-        } else if (c != '\r') {
-          // you've gotten a character on the current line
-          currentLineIsBlank = false;
-        }
-      }
-    }
-    // give the web browser time to receive the data
-    delay(1);
-
-    // close the connection:
-    webClient.stop();
-   if(EnableSerialDebug>0){
-     Serial.println("WIFI webClient disconnected");
-     MeasureTimer[0]=millis()+5000-MeasureTimer[1];
-   }
-  }
-  #endif
-}
-//-------------------------------------------------------------------------------------------------------
-
 void EthEvent(WiFiEvent_t event)
 {
   switch (event) {
@@ -2083,31 +1692,6 @@ void EthEvent(WiFiEvent_t event)
                 + " prio " + trxnetPrio[0] + "," + trxnetPrio[1]);
       }
 
-      #if defined(MQTT)
-        if (MQTT_ENABLE == true && MQTT_LOGIN == true){
-          // if (mqttClient.connect("esp32gwClient", MQTT_USER, MQTT_PASS)){
-          //   AfterMQTTconnect();
-          // }
-        }else if(MQTT_ENABLE == true){
-
-          mqttClient.setServer(mqtt_server_ip, MQTT_PORT);
-          Prn(1, "EthEvent-MQTTclient ");
-          mqttClient.setCallback(MqttRx);
-          Prn(1, "EthEvent-MQTTcallback ");
-          lastMqttReconnectAttempt = 0;
-
-          char charbuf[50];
-           // memcpy( charbuf, ETH.macAddress(), 6);
-           ETH.macAddress().toCharArray(charbuf, 18);
-           // charbuf[6] = 0;
-          if (mqttClient.connect(charbuf)){
-            Prn(0, "EthEvent-MQTTconnect ");
-            Prn(1, String(charbuf));
-            mqttReconnect();
-            AfterMQTTconnect();
-          }
-        }
-      #endif
       // ListCommands(0);
 
       // EnableSerialDebug=1;
@@ -2132,107 +1716,86 @@ void EthEvent(WiFiEvent_t event)
       break;
   }
 }
-//-------------------------------------------------------------------------------------------------------
-void Mqtt(){
-  #if defined(MQTT)
-    if (millis()-MqttStatusTimer[0]>MqttStatusTimer[1] && MQTT_ENABLE == true && eth_connected==1){
-      if(!mqttClient.connected()){
-        long now = millis();
-        if (now - lastMqttReconnectAttempt > 5000) {
-          lastMqttReconnectAttempt = now;
-          Serial.print("Attempt to MQTT reconnect | ");
-          Serial.println(millis()/1000);
-          if (mqttReconnect()) {
-            lastMqttReconnectAttempt = 0;
-          }
-        }
-      }else{
-        // Client connected
-        mqttClient.loop();
-      }
-      MqttStatusTimer[0]=millis();
-    }
-  #endif
-}
-
-//-------------------------------------------------------------------------------------------------------
-
-#if defined(MQTT)
-bool mqttReconnect() {
-    // charbuf[6] = 0;
-    char charbuf[50];
-    // memcpy( charbuf, ETH.macAddress(), 6);
-    ETH.macAddress().toCharArray(charbuf, 18);
-    if (mqttClient.connect(charbuf)) {
-      #if defined(TFTLCD)
-        bitSet(LcdNeedRefresh, 0);  // footer
-      #endif
-      Prn(1, "mqttReconnect-connected");
-      // IPAddress IPlocalAddr = ETH.localIP();                           // get
-      // String IPlocalAddrString = String(IPlocalAddr[0]) + "." + String(IPlocalAddr[1]) + "." + String(IPlocalAddr[2]) + "." + String(IPlocalAddr[3]);   // to string
-      // MqttPubStringQC(1, "IP", IPlocalAddrString, true);
-
-      // resubscribe
-
-      String topic = String(YOUR_CALL) + "/OI3/1/hz";
-      topic.reserve(50);
-      const char *cstr0 = topic.c_str();
-      if(mqttClient.subscribe(cstr0)==true){
-        if(EnableSerialDebug>0){
-          Prn(0, "mqttReconnect-subscribe ");
-          Prn(1, String(cstr0));
-        }
-      }
-      topic = String(YOUR_CALL) + "/OI3/2/hz";
-      topic.reserve(50);
-      const char *cstr1 = topic.c_str();
-      if(mqttClient.subscribe(cstr1)==true){
-        if(EnableSerialDebug>0){
-          Prn(0, "mqttReconnect-subscribe ");
-          Prn(1, String(cstr1));
-        }
-      }
-
-    }
-    return mqttClient.connected();
-}
-#endif
-
 //------------------------------------------------------------------------------------
 void onTrxNetHz(const char* from, const uint8_t* data, size_t len) {
-  if (len < 4) return;
+  if (len < 4 || from[0] == '\0') return;   // sender not in peer table yet
   uint32_t freq;
   memcpy(&freq, data, 4);
+  HzSrcNote(from, freq);
   if (strcmp(from, trxnetTrx1Name) == 0) {
-    TRXfreq[0] = freq;
     if (EnableSerialDebug > 0) { Prn(0, "TrxNet /hz TRX1 "); Prn(1, String(freq)); }
-    SelectANT(0);
-    #if defined(TFTLCD)
-      bitSet(LcdNeedRefresh, 1);
-    #endif
+    amSetFreq(0, freq);
   } else if (strcmp(from, trxnetTrx2Name) == 0) {
-    TRXfreq[1] = freq;
     if (EnableSerialDebug > 0) { Prn(0, "TrxNet /hz TRX2 "); Prn(1, String(freq)); }
-    SelectANT(1);
-    #if defined(TFTLCD)
-      bitSet(LcdNeedRefresh, 2);
-    #endif
+    amSetFreq(1, freq);
   }
 }
 
-//------------------------------------------------------------------------------------
-// DIN band-switch for output #9 -----------------------------------------------------
-
-// Map freq (Hz) to the DIN /s-gpio band byte for the multiband vertical on output #9.
-// Returns true and sets *out for a supported band; false when freq is inside #9 range
-// (1.81-10.15 MHz) but outside any supported band -> caller treats #9 as unavailable.
-bool DinBandByte(unsigned long f, uint8_t* out) {
-  if (f >= 1810000UL  && f <= 2000000UL)  { *out = 0x90; return true; }  // 160m
-  if (f >= 3500000UL  && f <= 3800000UL)  { *out = 0x14; return true; }  // 80m
-  if (f >= 7000000UL  && f <= 7200000UL)  { *out = 0x00; return true; }  // 40m
-  if (f >= 10100000UL && f <= 10150000UL) { *out = 0x18; return true; }  // 30m
-  return false;
+// Remember last /hz of a sender (reuses its slot, else the oldest one)
+void HzSrcNote(const char* from, uint32_t hz){
+  int slot = 0;
+  for(int i=0; i<HZ_SRC_MAX; i++){
+    if(hzSrc[i].ms && strcmp(hzSrc[i].name, from)==0){
+      slot = i;
+      break;
+    }
+    if(hzSrc[i].ms < hzSrc[slot].ms) slot = i;
+  }
+  strlcpy(hzSrc[slot].name, from, sizeof(hzSrc[slot].name));
+  hzSrc[slot].hz = hz;
+  hzSrc[slot].ms = millis() | 1;
 }
+
+const HzSrc* HzSrcFind(const char* name){
+  for(int i=0; i<HZ_SRC_MAX; i++){
+    if(hzSrc[i].ms && strcmp(hzSrc[i].name, name)==0) return &hzSrc[i];
+  }
+  return nullptr;
+}
+
+// Assign TrxNet device as frequency source of TRX (live + NVS). Empty name = none.
+// A device can feed only one TRX, taking it from the other TRX clears that one.
+void TrxSourceSet(int trx, const char* name){
+  char* dst   = trx==0 ? trxnetTrx1Name : trxnetTrx2Name;
+  char* other = trx==0 ? trxnetTrx2Name : trxnetTrx1Name;
+  if(name[0] && strcmp(other, name)==0){
+    other[0] = '\0';
+    amSetFreq(1-trx, 0);
+  }
+  strlcpy(dst, name, TRXNET_MAX_DEVICE_NAME);
+  Preferences p;
+  if(p.begin(HOST_NVS_NS, false)){
+    p.putString("trx1", trxnetTrx1Name);
+    p.putString("trx2", trxnetTrx2Name);
+    p.end();
+  }
+  // take over the last known frequency of the new source, 0 = wait for its /hz
+  const HzSrc* h = name[0] ? HzSrcFind(name) : nullptr;
+  amSetFreq(trx, h ? h->hz : 0);
+  Prn(1, "TRX"+String(trx+1)+" source "+String(name[0] ? name : "none"));
+}
+
+// TRX input enable (NVS "anthub" trx1en/trx2en, default enabled), applied live
+void TrxEnabledLoad(){
+  Preferences p;
+  if(!p.begin(HOST_NVS_NS, true)) return;
+  amSetEnabled(0, p.getBool("trx1en", true));
+  amSetEnabled(1, p.getBool("trx2en", true));
+  p.end();
+}
+
+void TrxEnabledSet(int trx, bool en){
+  amSetEnabled(trx, en);
+  Preferences p;
+  if(p.begin(HOST_NVS_NS, false)){
+    p.putBool(trx==0 ? "trx1en" : "trx2en", en);
+    p.end();
+  }
+  Prn(1, "TRX"+String(trx+1)+(en ? " enabled" : " disabled"));
+}
+
+//------------------------------------------------------------------------------------
+// DIN band-switch (AntMatrix external confirmation) -------------------------------
 
 // Forget the DIN band-switch state (leaves DIN relays in their last commanded state).
 void DinReset() {
@@ -2259,17 +1822,14 @@ void onTrxNetPeerAdded(const TrxPeer* peer) {
 
 // Drives the DIN band-switch state machine from loop() (never from a net.loop() callback).
 void DinBandLoop() {
-  // confirm: expected /gpio echo arrived while waiting -> route antenna to #9
+  // confirm: expected /gpio echo arrived while waiting -> AntMatrix routes the ext output
   if (dinGpioRx) {
     dinGpioRx = false;
     if (dinState == DIN_PENDING && dinReqTrx >= 0 && dinLastGpio == dinExpectedByte) {
       dinState         = DIN_CONFIRMED;
       dinConfirmedByte = dinExpectedByte;
-      TRXselectANT[dinReqTrx] = 8;
-      ShiftOut();
-      MqttPubString("TRX"+String(dinReqTrx+1)+"ant", String(9), 0);
-      MqttPubString("TRX"+String(dinReqTrx+1)+"antName", ANTname[8], 0);
       if (EnableSerialDebug > 0) Prn(1, "DIN band confirmed 0x"+String(dinExpectedByte, HEX));
+      amExtResult(dinReqTrx, true);
     }
   }
 
@@ -2283,12 +1843,13 @@ void DinBandLoop() {
     }
   }
 
-  // pending: send /s-gpio (reliable), retry up to DIN_MAX_ATTEMPTS, then give up on #1
+  // pending: send /s-gpio (reliable), retry up to DIN_MAX_ATTEMPTS, then give up (fallback stays)
   if (dinState == DIN_PENDING) {
     if (dinSendTimer == 0 || millis() - dinSendTimer >= DIN_RETRY_MS) {
       if (dinAttempts >= DIN_MAX_ATTEMPTS) {
         dinState = DIN_FAILED;
-        if (EnableSerialDebug > 0) Prn(1, "DIN band FAILED, stay on #1");
+        if (EnableSerialDebug > 0) Prn(1, "DIN band FAILED, stay on fallback");
+        amExtResult(dinReqTrx, false);
       } else {
         bool ok = net.publishTo(trxnetDinName, "/s-gpio", &dinExpectedByte, 1, TRX_CON);
         dinAttempts++;
@@ -2301,110 +1862,6 @@ void DinBandLoop() {
 }
 
 //------------------------------------------------------------------------------------
-void MqttRx(char *topic, byte *payload, unsigned int length) {
-  #if defined(MQTT)
-    String CheckTopicBase;
-    CheckTopicBase.reserve(100);
-    byte* p = (byte*)malloc(length);
-    memcpy(p,payload,length);
-    static bool HeardBeatStatus;
-    if(EnableSerialDebug>0){
-      Prn(0, String("RX mqtt..."));
-    }
-
-        CheckTopicBase = String(YOUR_CALL) + "/OI3/1/hz";
-        if ( CheckTopicBase.equals( String(topic) )){
-          if(EnableSerialDebug>0){
-            Prn(0, String("/OI3/1/hz "));
-          }
-          TRXfreq[0] = 0;
-          unsigned long exp = 1;
-          for (int i = length-1; i >=0 ; i--) {
-            TRXfreq[0] = TRXfreq[0] + (p[i]-48)*exp;
-            exp = exp*10;
-          }
-          if(EnableSerialDebug>0){
-            Prn(1, String(TRXfreq[0]));
-          }
-          SelectANT(0);
-          #if defined(TFTLCD)
-            bitSet(LcdNeedRefresh, 1);
-          #endif
-        }
-
-        CheckTopicBase = String(YOUR_CALL) + "/OI3/2/hz";
-        if ( CheckTopicBase.equals( String(topic) )){
-          if(EnableSerialDebug>0){
-            Prn(0, String("/OI3/2/hz "));
-          }
-          TRXfreq[1] = 0;
-          unsigned long exp = 1;
-          for (int i = length-1; i >=0 ; i--) {
-            TRXfreq[1] = TRXfreq[1] + (p[i]-48)*exp;
-            exp = exp*10;
-          }
-          if(EnableSerialDebug>0){
-            Prn(1, String(TRXfreq[1]));
-          }
-          SelectANT(1);
-          #if defined(TFTLCD)
-            bitSet(LcdNeedRefresh, 2);
-          #endif
-          // FreqToBandRules(freq);
-        }
-
-  #endif
-} // MqttRx END
-
-//-------------------------------------------------------------------------------------------------------
-void AfterMQTTconnect(){
-  #if defined(MQTT)
-  //    if (mqttClient.connect("esp32gwClient", MQTT_USER, MQTT_PASS)) {          // public IP addres to MQTT
-        IPAddress IPlocalAddr = ETH.localIP();                           // get
-        String IPlocalAddrString = String(IPlocalAddr[0]) + "." + String(IPlocalAddr[1]) + "." + String(IPlocalAddr[2]) + "." + String(IPlocalAddr[3]);   // to string
-        IPlocalAddrString.toCharArray( mqttTX, 50 );                          // to array
-        String path2 = String(YOUR_CALL) + "/"+String(hardware)+"/ip";
-        path2.toCharArray( mqttPath, 100 );
-          mqttClient.publish(mqttPath, mqttTX, true);
-            // Serial.print("MQTT-TX ");
-            // Serial.print(mqttPath);
-            // Serial.print(" ");
-            // Serial.println(mqttTX);
-
-        String MAClocalAddrString = ETH.macAddress();   // to string
-        MAClocalAddrString.toCharArray( mqttTX, 50 );                          // to array
-        path2 = String(YOUR_CALL) + "/"+String(hardware)+"/mac";
-        path2.toCharArray( mqttPath, 100 );
-          mqttClient.publish(mqttPath, mqttTX, true);
-            // Serial.print("MQTT-TX ");
-            // Serial.print(mqttPath);
-            // Serial.print(" ");
-            // Serial.println(mqttTX);
-
-    // MeasureTimer[0]=2800000;
-    MeasureTimer[0]=millis()-MeasureTimer[1];
-
-  #endif
-}
-//-----------------------------------------------------------------------------------
-void MqttPubString(String TOPIC, String DATA, bool RETAIN){
-  #if defined(MQTT)
-    char charbuf[50];
-     // memcpy( charbuf, mac, 6);
-     ETH.macAddress().toCharArray(charbuf, 18);
-     // charbuf[6] = 0;
-    // if(EnableEthernet==1 && MQTT_ENABLE==1 && EthLinkStatus==1 && mqttClient.connected()==true){
-    if(mqttClient.connected()==true){
-      if (mqttClient.connect(charbuf)) {
-        String topic = String(YOUR_CALL) + "/"+String(hardware)+"/"+TOPIC;
-        topic.toCharArray( mqttPath, 50 );
-        DATA.toCharArray( mqttTX, 50 );
-        mqttClient.publish(mqttPath, mqttTX, RETAIN);
-      }
-    }
-  #endif
-}
-//-------------------------------------------------------------------------------------------------------
 void Telnet(){
   uint8_t i;
   // if (wifiMulti.run() == WL_CONNECTED) {
@@ -2518,76 +1975,59 @@ String UtcTime(int format){
 
 //-------------------------------------------------------------------------------------------------------
 
-void SelectANT(int TRX){  // TRX 0 1
-  TRXselectANT[TRX] = 42;
-  int counter=0;
-  for(int ant=0; ant<16; ant++){
-    if(ANTrange[ant][0]<TRXfreq[TRX] && TRXfreq[TRX]<ANTrange[ant][1]){
-      AvailableANTpool[counter][TRX]=ant+1;
-      counter++;
-      for(int NumberOfTrx=0; NumberOfTrx<2; NumberOfTrx++){
-        if(NumberOfTrx!=TRX){
-          if(TRXselectANT[NumberOfTrx]!=ant && TXANT[ant]==1){
-            TRXselectANT[TRX]=ant;
-            // Prn(1, "ant|NumberOfTrx|TRX|TRXselectANT[TRX] "+String(ant)+"|"+String(NumberOfTrx)+"|"+String(TRX)+"|"+String(TRXselectANT[TRX]));
-          }
-        }
-      }
-    }else{
-      AvailableANTpool[counter][TRX]=0;
-      counter++;
-    }
-  }
-  // Output #9 (index 8) = multiband vertical behind DIN band-switch.
-  if(TRXselectANT[TRX]==8){
-    uint8_t want;
-    if(!DinBandByte(TRXfreq[TRX], &want)){
-      // inside #9 range but outside a supported band -> antenna unavailable, use #1
-      TRXselectANT[TRX]=0;
-      if(dinReqTrx==TRX) DinReset();
-    }else{
-      bool sameTarget = (dinReqTrx==TRX && dinExpectedByte==want && dinState!=DIN_IDLE);
-      if(dinState==DIN_CONFIRMED && sameTarget){
-        // already confirmed for this band -> keep #9 (leave selection = 8)
-      }else if(sameTarget){
-        // PENDING or FAILED for this exact band -> don't restart, hold on #1
-        TRXselectANT[TRX]=0;
-      }else{
-        // new band (or first request) -> start confirm sequence, hold on #1
-        dinState        = DIN_PENDING;
-        dinReqTrx       = TRX;
-        dinExpectedByte = want;
-        dinAttempts     = 0;
-        dinSendTimer    = 0;          // DinBandLoop() sends immediately
-        TRXselectANT[TRX]=0;
+// AntMatrix glue ----------------------------------------------------------------------------------------
+
+// Defaults (first boot, "Defaults" button): the former hard-coded antenna table.
+// Output is allowed in a band row when its old range covered the whole band.
+void AmHostDefaults(AmConfig& c){
+  static const unsigned long legacyRange[AM_OUT][2] = {  // Hz from, to
+    {1810000, 52000000},  // #1 Dummy
+    {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0},
+    {1810000, 10150000},  // #9 Vertical behind DIN band-switch
+    {0, 0},               // #10
+    {14000000, 14350000}, // #11
+    {21000000, 21450000}, // #12
+    {28000000, 29700000}, // #13
+    {50000000, 52000000}, // #14
+    {0, 0}, {0, 0}
+  };
+  static const char* legacyName[AM_OUT] = {
+    "Dummy", "free", "free", "free", "free", "free", "free", "free",
+    "Vertical", "Dipole", "Quad", "Quad", "Quad", "Yagi", "free", "free"
+  };
+  static const bool legacyTx[AM_OUT] = {1,0,0,0,0,0,0,0, 1,1,1,1,1,1,0,0};
+
+  c.rows[11].fMin = 1810;   // catch-all row: Dummy also outside the bands, as before
+  c.rows[11].fMax = 52000;
+  for(int i=0; i<AM_ROWS; i++){
+    if(c.rows[i].fMax==0) continue;
+    for(int o=0; o<AM_OUT; o++){
+      if(legacyRange[o][1]!=0 && legacyRange[o][0]<=c.rows[i].fMin*1000UL && c.rows[i].fMax*1000UL<=legacyRange[o][1]){
+        for(int t=0; t<AM_TRX; t++) c.rows[i].mask[t] |= (1u << o);
       }
     }
-  }else if(dinReqTrx==TRX){
-    // this TRX left #9 -> forget state (DIN keeps its last relay state)
-    DinReset();
   }
-  ShiftOut();
-  MqttPubString("TRX"+String(TRX+1)+"ant", String(TRXselectANT[TRX]+1), 0);
-  MqttPubString("TRX"+String(TRX+1)+"antName", ANTname[TRXselectANT[TRX]], 0);
+  for(int o=0; o<AM_OUT; o++){
+    strlcpy(c.out[o].name, legacyName[o], AM_NAME_LEN);
+    c.out[o].disabled = !legacyTx[o];
+  }
+  c.out[8].extConfirm = true;   // #9 waits for DIN, #1 Dummy meanwhile
+  c.out[8].fallback   = 0;
+  c.rows[0].extCode = 0x90;     // 160m
+  c.rows[1].extCode = 0x14;     // 80m
+  c.rows[3].extCode = 0x00;     // 40m
+  c.rows[4].extCode = 0x18;     // 30m
 }
 
-//-------------------------------------------------------------------------------------------------------
-
-void ShiftOut(){
+// TRX1 -> ShiftOutByte[0..1], TRX2 -> ShiftOutByte[2..3], one bit per TRX
+void AmWriteOutputs(const int8_t* active){
   for(int i=0; i<4; i++){
     ShiftOutByte[i]=0x00;
   }
-  // TRX1
-  if(TRXselectANT[0]<8){
-    bitSet(ShiftOutByte[0], TRXselectANT[0]);
-  }else if(TRXselectANT[0]>7 && TRXselectANT[0]<16){
-    bitSet(ShiftOutByte[1], TRXselectANT[0]-8);
-  }
-  // TRX2
-  if(TRXselectANT[1]<8){
-    bitSet(ShiftOutByte[2], TRXselectANT[1]);
-  }else if(TRXselectANT[1]>7 && TRXselectANT[1]<16){
-    bitSet(ShiftOutByte[3], TRXselectANT[1]-8);
+  for(int t=0; t<2 && t<AM_TRX; t++){
+    if(active[t]>=0 && active[t]<16){
+      bitSet(ShiftOutByte[t*2+active[t]/8], active[t]%8);
+    }
   }
   digitalWrite(ShiftOutLatchPin, LOW);
   shiftOut(ShiftOutDataPin, ShiftOutClockPin, LSBFIRST, ShiftOutByte[3]);
@@ -2596,8 +2036,284 @@ void ShiftOut(){
   shiftOut(ShiftOutDataPin, ShiftOutClockPin, LSBFIRST, ShiftOutByte[0]);
   digitalWrite(ShiftOutLatchPin, HIGH);
   if(EnableSerialDebug>0){
-    Prn(1, "TRX1/2 "+String(TRXselectANT[0]+1)+"/"+String(TRXselectANT[1]+1)+"|ShiftOut 0123 "+String(ShiftOutByte[0], BIN)+"|"+String(ShiftOutByte[1], BIN)+"|"+String(ShiftOutByte[2], BIN)+"|"+String(ShiftOutByte[3], BIN));
+    Prn(1, "TRX1/2 "+String(active[0]+1)+"/"+String(active[1]+1)+"|ShiftOut 0123 "+String(ShiftOutByte[0], BIN)+"|"+String(ShiftOutByte[1], BIN)+"|"+String(ShiftOutByte[2], BIN)+"|"+String(ShiftOutByte[3], BIN));
   }
-
 }
 
+// ext output selected -> start DIN confirm sequence (DinBandLoop() sends immediately)
+void AmExtRequest(uint8_t trx, uint8_t out, uint8_t code){
+  dinState        = DIN_PENDING;
+  dinReqTrx       = trx;
+  dinExpectedByte = code;
+  dinAttempts     = 0;
+  dinSendTimer    = 0;
+  if(EnableSerialDebug>0) Prn(1, "TRX"+String(trx+1)+" wants #"+String(out+1)+", DIN code 0x"+String(code, HEX));
+}
+
+// TRX left the ext output -> forget state (DIN keeps its last relay state)
+void AmExtCancel(uint8_t trx){
+  if(dinReqTrx==trx) DinReset();
+}
+
+void AmChanged(uint8_t trx){
+  #if defined(TFTLCD)
+    if(trx<2) bitSet(LcdNeedRefresh, trx+1);
+  #endif
+}
+
+uint32_t AmMillis(){
+  return millis();
+}
+
+//-------------------------------------------------------------------------------------------------------
+// Host settings (NVS "anthub") --------------------------------------------------------------------------
+
+static void HostGetStr(Preferences& p, const char* key, char* dst, size_t len){
+  if(p.isKey(key)) p.getString(key, dst, len);
+}
+
+// stored settings, running values where nothing is stored
+void HostRead(HostCfg& h){
+  h.dhcp = DHCP_ENABLE;
+  h.ip   = StaticIp;
+  h.mask = StaticMask;
+  h.gw   = StaticGw;
+  h.dns  = StaticDns;
+  h.port = trxnetPort;
+  strlcpy(h.antId, trxnetAntId, sizeof(h.antId));
+  strlcpy(h.trx1, trxnetTrx1Name, sizeof(h.trx1));
+  strlcpy(h.trx2, trxnetTrx2Name, sizeof(h.trx2));
+  strlcpy(h.din, trxnetDinName, sizeof(h.din));
+  for(int i=0; i<2; i++) strlcpy(h.prio[i], trxnetPrio[i], sizeof(h.prio[i]));
+  Preferences p;
+  if(!p.begin(HOST_NVS_NS, true)) return;   // nothing saved yet
+  h.dhcp = p.getBool("dhcp", h.dhcp);
+  h.ip   = p.getUInt("ip",   h.ip);
+  h.mask = p.getUInt("mask", h.mask);
+  h.gw   = p.getUInt("gw",   h.gw);
+  h.dns  = p.getUInt("dns",  h.dns);
+  h.port = p.getUShort("port", h.port);
+  HostGetStr(p, "antId", h.antId, sizeof(h.antId));
+  HostGetStr(p, "trx1",  h.trx1,  sizeof(h.trx1));
+  HostGetStr(p, "trx2",  h.trx2,  sizeof(h.trx2));
+  HostGetStr(p, "din",   h.din,   sizeof(h.din));
+  HostGetStr(p, "prio0", h.prio[0], sizeof(h.prio[0]));
+  HostGetStr(p, "prio1", h.prio[1], sizeof(h.prio[1]));
+  p.end();
+}
+
+// apply stored settings at boot
+void HostLoad(){
+  HostCfg h;
+  HostRead(h);
+  DHCP_ENABLE = h.dhcp;
+  StaticIp    = h.ip;
+  StaticMask  = h.mask;
+  StaticGw    = h.gw;
+  StaticDns   = h.dns;
+  trxnetPort  = h.port;
+  strlcpy(trxnetAntId, h.antId, sizeof(trxnetAntId));
+  strlcpy(trxnetTrx1Name, h.trx1, sizeof(trxnetTrx1Name));
+  strlcpy(trxnetTrx2Name, h.trx2, sizeof(trxnetTrx2Name));
+  strlcpy(trxnetDinName, h.din, sizeof(trxnetDinName));
+  for(int i=0; i<2; i++){
+    strlcpy(trxnetPrio[i], h.prio[i], sizeof(trxnetPrio[i]));
+    trxnetPrioPtr[i] = trxnetPrio[i][0] ? trxnetPrio[i] : nullptr;   // empty prefix would match all
+  }
+}
+
+bool HostSave(const HostCfg& h){
+  Preferences p;
+  if(!p.begin(HOST_NVS_NS, false)) return false;
+  bool ok = p.putBool("dhcp", h.dhcp)
+         && p.putUInt("ip", h.ip) && p.putUInt("mask", h.mask) && p.putUInt("gw", h.gw) && p.putUInt("dns", h.dns)
+         && p.putUShort("port", h.port)
+         && p.putString("antId", h.antId) == strlen(h.antId)
+         && p.putString("trx1", h.trx1) == strlen(h.trx1)
+         && p.putString("trx2", h.trx2) == strlen(h.trx2)
+         && p.putString("din", h.din) == strlen(h.din)
+         && p.putString("prio0", h.prio[0]) == strlen(h.prio[0])
+         && p.putString("prio1", h.prio[1]) == strlen(h.prio[1]);
+  p.end();
+  return ok;
+}
+
+//-------------------------------------------------------------------------------------------------------
+// HTTP /setup ---------------------------------------------------------------------------------------------
+
+void HttpJson(int code, JsonDocument& d){
+  String out;
+  serializeJson(d, out);
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send(code, "application/json", out);
+}
+
+void HttpError(const char* msg){
+  JsonDocument d;
+  d["error"] = msg;
+  HttpJson(400, d);
+}
+
+void HttpSetupPage(){
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send_P(200, "text/html", SETUP_PAGE);
+}
+
+void HttpSetupGet(){
+  HostCfg h;
+  HostRead(h);
+  String call;
+  for(int i=141; i<161; i++){
+    if(EEPROM.read(i)!=0xff) call += char(EEPROM.read(i));
+  }
+  JsonDocument d;
+  d["call"]  = call;
+  d["dhcp"]  = h.dhcp;
+  d["ip"]    = h.ip.toString();
+  d["mask"]  = h.mask.toString();
+  d["gw"]    = h.gw.toString();
+  d["dns"]   = h.dns.toString();
+  d["port"]  = String(h.port);
+  d["antId"] = h.antId;
+  d["trx1"]  = h.trx1;
+  d["trx2"]  = h.trx2;
+  d["din"]   = h.din;
+  d["prio0"] = h.prio[0];
+  d["prio1"] = h.prio[1];
+  d["mac"]   = ETH.macAddress();
+  d["curIp"] = ETH.localIP().toString();
+  d["fw"]    = REV;
+  HttpJson(200, d);
+}
+
+// copy name if it fits and uses only [A-Za-z0-9._/-]
+bool HttpName(JsonVariantConst v, char* dst, size_t len, bool allowEmpty){
+  const char* s = v | "";
+  size_t n = strlen(s);
+  if(n>=len || (!allowEmpty && n==0)) return false;
+  for(size_t i=0; i<n; i++){
+    if(!isalnum((unsigned char)s[i]) && !strchr("._/-", s[i])) return false;
+  }
+  strlcpy(dst, s, len);
+  return true;
+}
+
+bool HttpIp(JsonVariantConst v, IPAddress& ip){
+  const char* s = v | "";
+  return ip.fromString(s);
+}
+
+void HttpSetupPost(){
+  JsonDocument d;
+  if(deserializeJson(d, server.arg("plain"))){
+    HttpError("bad json");
+    return;
+  }
+  HostCfg h;
+  HostRead(h);   // keeps TRX sources, those are set live on the device list
+  char call[21];
+  h.dhcp = d["dhcp"] | true;
+  if(!HttpIp(d["ip"], h.ip) || !HttpIp(d["mask"], h.mask) || !HttpIp(d["gw"], h.gw) || !HttpIp(d["dns"], h.dns)){
+    HttpError("bad IP address");
+    return;
+  }
+  long port = d["port"] | 0L;
+  if(port<1 || port>65535){
+    HttpError("bad UDP port");
+    return;
+  }
+  h.port = port;
+  if(!HttpName(d["call"], call, sizeof(call), true)){
+    HttpError("bad callsign (max 20 chars A-Z 0-9 . _ / -)");
+    return;
+  }
+  if(!HttpName(d["antId"], h.antId, sizeof(h.antId), false)
+     || !HttpName(d["din"], h.din, sizeof(h.din), true)
+     || !HttpName(d["prio0"], h.prio[0], sizeof(h.prio[0]), true)
+     || !HttpName(d["prio1"], h.prio[1], sizeof(h.prio[1]), true)){
+    HttpError("bad TrxNet name (allowed A-Z 0-9 . _ / -)");
+    return;
+  }
+  if(!HostSave(h)){
+    HttpError("NVS write failed");
+    return;
+  }
+  // callsign in EEPROM 141-160 (shared with CLI 'L'), 0xff = unused
+  for(int i=0; i<20; i++){
+    EEPROM.write(141+i, i<(int)strlen(call) ? call[i] : 0xff);
+  }
+  EEPROM.commit();
+  JsonDocument ok;
+  ok["ok"] = true;
+  HttpJson(200, ok);
+}
+
+// TrxNet device list for picking TRX frequency sources
+void HttpPeersGet(){
+  uint32_t now = millis();
+  JsonDocument d;
+  d["trx1"] = trxnetTrx1Name;
+  d["trx2"] = trxnetTrx2Name;
+  d["din"]  = trxnetDinName;
+  JsonArray en = d["en"].to<JsonArray>();
+  for(int t=0; t<2; t++) en.add(!amTrx(t).disabled);
+  JsonArray a = d["peers"].to<JsonArray>();
+  for(int i=0; i<net.peerCount(); i++){
+    const TrxPeer* p = net.peer(i);
+    if(!p) continue;
+    JsonObject o = a.add<JsonObject>();
+    o["name"] = p->name;
+    o["ip"]   = p->ip.toString();
+    o["port"] = p->port;
+    o["seen"] = now - p->lastSeen;
+    const HzSrc* h = HzSrcFind(p->name);
+    if(h){
+      o["hz"]    = h->hz;
+      o["hzAge"] = now - h->ms;
+    }
+  }
+  HttpJson(200, d);
+}
+
+// {"trx":0,"name":"705.01"}, empty name = no source
+void HttpTrxSource(){
+  JsonDocument d;
+  char name[TRXNET_MAX_DEVICE_NAME];
+  if(deserializeJson(d, server.arg("plain"))){
+    HttpError("bad json");
+    return;
+  }
+  long trx = d["trx"] | -1L;
+  if(trx<0 || trx>1 || !HttpName(d["name"], name, sizeof(name), true)){
+    HttpError("bad trx/name");
+    return;
+  }
+  TrxSourceSet(trx, name);
+  JsonDocument ok;
+  ok["ok"] = true;
+  HttpJson(200, ok);
+}
+
+// {"trx":0,"en":false}
+void HttpTrxEnable(){
+  JsonDocument d;
+  if(deserializeJson(d, server.arg("plain"))){
+    HttpError("bad json");
+    return;
+  }
+  long trx = d["trx"] | -1L;
+  if(trx<0 || trx>1 || !d["en"].is<bool>()){
+    HttpError("bad trx/en");
+    return;
+  }
+  TrxEnabledSet(trx, d["en"].as<bool>());
+  JsonDocument ok;
+  ok["ok"] = true;
+  HttpJson(200, ok);
+}
+
+void HttpReboot(){
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(300);
+  ESP.restart();
+}
