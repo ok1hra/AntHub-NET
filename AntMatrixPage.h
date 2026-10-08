@@ -55,7 +55,9 @@ table.mx{border-collapse:collapse;font-size:12px}
 .mx input[type=number]{width:68px;text-align:right}
 .mx input.nm{width:58px}
 .mx select{width:46px}
-.mx input.code{width:34px;text-align:center;text-transform:uppercase}
+.mx input.bt{width:12px;height:12px;margin:0 1px;accent-color:var(--orange);vertical-align:middle}
+.mx input.bt.g{margin-left:6px}
+.mx input.du{margin-right:6px;vertical-align:middle}
 .mx input[type=checkbox]{accent-color:var(--blue)}
 .mx tr.hit td{background:#003a00}
 .mx tr.hit input{background:transparent;color:var(--green)}
@@ -98,7 +100,8 @@ const char AM_PAGE_BODY[] PROGMEM = R"AM(<span id="conn" class="topbar-fw"></spa
     <span class="sw" style="background:#3a2a00"></span>waiting for external confirmation
     <span class="sw" style="background:var(--blue)"></span>held by another TRX<br>
     Rows are shared by all TRX, checkboxes are per TRX (tabs). The highest free output wins, lower ones are backup.
-    Ext code (hex) is sent to the external device for outputs with <i>Ext confirm</i>; empty = output not usable in that band.
+    DIN: for outputs with <i>Ext confirm</i> the checked bits 0&ndash;7 are sent to the DIN band-switch (bit 0 = first DIN input);
+    <i>use</i> unchecked = output not usable in that band, all bits off = all DIN relays off.
   </div>
 </section>
 </main>
@@ -107,7 +110,6 @@ const N=16,$=id=>document.getElementById(id);
 let cfg=null,saved=null,st=null,tab=0,dirty=false,busy=false;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const bit=(m,o)=>((m>>o)&1)===1;
-const hex=n=>n<0?'':n.toString(16).toUpperCase().padStart(2,'0');
 const clone=o=>JSON.parse(JSON.stringify(o));
 function outLbl(o){return o<0?'off':'#'+(o+1)+' '+esc(saved?saved.out[o].name:'');}
 function fmtHz(hz){return hz?(hz/1e6).toFixed(4)+' MHz':'&mdash;';}
@@ -124,7 +126,7 @@ async function loadCfg(def){
 }
 
 function render(){
-  let h='<thead><tr><th>fMin kHz</th><th>fMax kHz</th><th title="Code for external device (hex)">Ext</th>';
+  let h='<thead><tr><th>fMin kHz</th><th>fMax kHz</th><th title="DIN band-switch: use checkbox, then bits 0-7 sent as /s-gpio for outputs with Ext confirm">DIN use &middot; bits 0&ndash;7</th>';
   for(let o=0;o<N;o++)h+=`<th id="h${o}" class="oh">${o+1}</th>`;
   h+='</tr><tr><th colspan="3" class="lbl">Name</th>';
   for(let o=0;o<N;o++)h+=`<td><input class="nm" maxlength="10" data-k="name" data-o="${o}" value="${esc(cfg.out[o].name)}"></td>`;
@@ -142,12 +144,20 @@ function render(){
   cfg.rows.forEach((r,i)=>{
     h+=`<tr id="r${i}"><td><input type="number" min="0" data-k="fMin" data-i="${i}" value="${r.fMin}"></td>`+
        `<td><input type="number" min="0" data-k="fMax" data-i="${i}" value="${r.fMax}"></td>`+
-       `<td><input class="code" maxlength="2" placeholder="&ndash;" data-k="code" data-i="${i}" value="${hex(r.code)}"></td>`;
+       `<td>${dinCell(r.code,i)}</td>`;
     for(let o=0;o<N;o++)h+=`<td class="c${o}"><input type="checkbox" data-k="m" data-i="${i}" data-o="${o}"${bit(r.mask[tab],o)?' checked':''}></td>`;
     h+='</tr>';
   });
   $('mx').innerHTML=h+'</tbody>';
   renderTabs();check();highlight();
+}
+
+// DIN cell: "use" checkbox (unchecked = code -1, output not usable in the band) + bits 0-7
+function dinCell(code,i){
+  const u=code>=0;
+  let h=`<input type="checkbox" class="du" data-k="cu" data-i="${i}" title="use DIN band-switch in this band"${u?' checked':''}>`;
+  for(let b=0;b<8;b++)h+=`<input type="checkbox" class="bt${b===4?' g':''}" data-k="cb" data-i="${i}" data-b="${b}" title="bit ${b}"${u&&bit(code,b)?' checked':''}${u?'':' disabled'}>`;
+  return h;
 }
 
 function renderTabs(){
@@ -163,9 +173,7 @@ function check(){
   cfg.rows.forEach((r,i)=>{
     const bad=r.fMax!==0&&r.fMin>r.fMax;
     document.querySelectorAll(`#r${i} input[type=number]`).forEach(e=>e.classList.toggle('bad',bad));
-    const c=document.querySelector(`#r${i} input.code`),v=c.value.trim(),cb=v!==''&&!/^[0-9a-f]{1,2}$/i.test(v);
-    c.classList.toggle('bad',cb);
-    if(bad||cb)ok=false;
+    if(bad)ok=false;
   });
   return ok;
 }
@@ -177,7 +185,8 @@ $('mx').addEventListener('input',e=>{
   else if(k==='dis'||k==='ext')cfg.out[o][k]=el.checked;
   else if(k==='fb')cfg.out[o].fb=+el.value;
   else if(k==='fMin'||k==='fMax')cfg.rows[i][k]=parseInt(el.value)||0;
-  else if(k==='code'){const v=el.value.trim();cfg.rows[i].code=/^[0-9a-f]{1,2}$/i.test(v)?parseInt(v,16):-1;}
+  else if(k==='cu'){cfg.rows[i].code=el.checked?0:-1;el.parentNode.innerHTML=dinCell(cfg.rows[i].code,i);}
+  else if(k==='cb'){const b=+el.dataset.b;if(el.checked)cfg.rows[i].code|=1<<b;else cfg.rows[i].code&=~(1<<b);}
   else if(k==='m'){if(el.checked)cfg.rows[i].mask[tab]|=1<<o;else cfg.rows[i].mask[tab]&=~(1<<o);}
   setDirty(true);check();highlight();
 });

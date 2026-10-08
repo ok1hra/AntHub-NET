@@ -65,7 +65,7 @@ Použití knihovny Wire ve verzi 2.0.0 v adresáři: /home/dan/Arduino/hardware/
 #define ETH_CLK ETH_CLOCK_GPIO17_OUT    // CLKIN pin5 | settings for ESP32 GATEWAY rev f-g
 
 //-------------------------------------------------------------------------------------------------------
-const char* REV = "20260925";
+const char* REV = "20261008";
 char hardware[] = "ANT";
 // const char* HWNAME = "IP-ROT";
 int ANT = 8;
@@ -208,13 +208,15 @@ const char* trxnetPrioPtr[2]  = { trxnetPrio[0], trxnetPrio[1] };
 // --- DIN band-switch = AntMatrix external confirmation -------------------------
 // Outputs with "Ext confirm" (default #9, multiband vertical) sit behind a remote
 // band-switch driven by the DIN device over TrxNet. AntMatrix calls AmExtRequest()
-// with the band row ext code; we command DIN's 8 FREE GPIO via /s-gpio (1 byte) and
-// confirm via its /gpio echo, then report amExtResult(). Meanwhile AntMatrix keeps the
+// with the band row ext code; we command DIN's 8 input bits via /s-gpio (1 byte) and
+// confirm via its /gpio reply, then report amExtResult(). Meanwhile AntMatrix keeps the
 // output's fallback (default #1 Dummy) active.
-// DIN bit->GPIO map is {0,2,4,12,13,14,32,33}; unused bits stay 0 (DIN is dedicated).
+// DIN /gpio = [outputs, applied input]: byte 1 is compared, so DIN may route the bits to
+// any outputs through its SETUP-4 matrix (older DIN firmware sends 1 byte = outputs).
+// DIN default bit->GPIO map is {0,2,4,12,13,14,32,33}; unused bits stay 0 (DIN is dedicated).
 // Default codes: 160m=0x90, 80m=0x14, 40m=0x00, 30m=0x18 (GPIO33/4/12/13).
 // Set once per band change; retry only on failure; recover on DIN rejoin.
-char        trxnetDinName[TRXNET_MAX_DEVICE_NAME] = "DIN.01";  // configured on /setup
+char        trxnetDinName[TRXNET_MAX_DEVICE_NAME] = "DIN.01";  // picked on /setup device list
 enum DinState { DIN_IDLE, DIN_PENDING, DIN_CONFIRMED, DIN_FAILED };
 DinState      dinState        = DIN_IDLE;
 int           dinReqTrx       = -1;    // which TRX requested the ext output
@@ -621,6 +623,7 @@ void setup() {
    server.on("/api/reboot", HTTP_POST, HttpReboot);
    server.on("/api/peers",  HTTP_GET,  HttpPeersGet);
    server.on("/api/trxsrc", HTTP_POST, HttpTrxSource);
+   server.on("/api/dinsel", HTTP_POST, HttpDinSelect);
    server.on("/api/trxen",  HTTP_POST, HttpTrxEnable);
    server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
    server.begin();
@@ -1811,8 +1814,25 @@ void DinReset() {
 void onTrxNetGpio(const char* from, const uint8_t* data, size_t len) {
   if (len < 1) return;
   if (strcmp(from, trxnetDinName) != 0) return;
-  dinLastGpio = data[0];
+  dinLastGpio = len >= 2 ? data[1] : data[0];   // applied input, or outputs from old DIN firmware
   dinGpioRx   = true;
+}
+
+// Assign the DIN band-switch device (live + NVS). Empty name = none (ext outputs fail
+// to their fallback). A band still wanted is sent to the new device right away.
+void DinTargetSet(const char* name){
+  strlcpy(trxnetDinName, name, sizeof(trxnetDinName));
+  Preferences p;
+  if(p.begin(HOST_NVS_NS, false)){
+    p.putString("din", trxnetDinName);
+    p.end();
+  }
+  if(dinReqTrx >= 0 && dinState != DIN_IDLE){
+    dinState     = DIN_PENDING;
+    dinAttempts  = 0;
+    dinSendTimer = 0;
+  }
+  Prn(1, "DIN band-switch "+String(name[0] ? name : "none"));
 }
 
 // DIN (re)joined the peer table: re-arm one send if we still want a band. Keep short.
@@ -2210,7 +2230,7 @@ void HttpSetupPost(){
     return;
   }
   HostCfg h;
-  HostRead(h);   // keeps TRX sources, those are set live on the device list
+  HostRead(h);   // keeps TRX sources and DIN, those are set live on the device list
   char call[21];
   h.dhcp = d["dhcp"] | true;
   if(!HttpIp(d["ip"], h.ip) || !HttpIp(d["mask"], h.mask) || !HttpIp(d["gw"], h.gw) || !HttpIp(d["dns"], h.dns)){
@@ -2228,7 +2248,6 @@ void HttpSetupPost(){
     return;
   }
   if(!HttpName(d["antId"], h.antId, sizeof(h.antId), false)
-     || !HttpName(d["din"], h.din, sizeof(h.din), true)
      || !HttpName(d["prio0"], h.prio[0], sizeof(h.prio[0]), true)
      || !HttpName(d["prio1"], h.prio[1], sizeof(h.prio[1]), true)){
     HttpError("bad TrxNet name (allowed A-Z 0-9 . _ / -)");
@@ -2289,6 +2308,24 @@ void HttpTrxSource(){
     return;
   }
   TrxSourceSet(trx, name);
+  JsonDocument ok;
+  ok["ok"] = true;
+  HttpJson(200, ok);
+}
+
+// {"name":"DIN.01"}, empty name = no DIN band-switch
+void HttpDinSelect(){
+  JsonDocument d;
+  char name[TRXNET_MAX_DEVICE_NAME];
+  if(deserializeJson(d, server.arg("plain"))){
+    HttpError("bad json");
+    return;
+  }
+  if(!HttpName(d["name"], name, sizeof(name), true)){
+    HttpError("bad name");
+    return;
+  }
+  DinTargetSet(name);
   JsonDocument ok;
   ok["ok"] = true;
   HttpJson(200, ok);
